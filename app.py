@@ -24,15 +24,15 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-this-secret")
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
 
 DB_CONFIG = {
-    "host": "zds-prod-jbdb3-vip.bo3.e-dialog.com",
-    "user": "techuser",
+    "host": "",
+    "user": "",
     "password": "",
-    "database": "CUST_TECH_DB",
+    "database": "",
     "charset": "utf8mb4",
     "autocommit": True,
 }
@@ -206,7 +206,7 @@ def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
             admin_user = os.getenv("APP_DEFAULT_ADMIN", "admin")
-            admin_pass = os.getenv("APP_DEFAULT_ADMIN_PASSWORD", "admin123")
+            admin_pass = os.getenv("APP_DEFAULT_ADMIN_PASSWORD", "")
             cur.execute("SELECT id FROM users WHERE username=%s", (admin_user,))
             if not cur.fetchone():
                 cur.execute(
@@ -434,6 +434,21 @@ def update_request_db(request_uuid, **kwargs):
     finally:
         conn.close()
 
+
+
+def get_request_overall_status(request_uuid):
+    """Return the status already set by a request processor, if any."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT overall_status FROM requests WHERE request_uuid=%s",
+                (request_uuid,),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+    finally:
+        conn.close()
 
 
 def _request_scope(username):
@@ -678,9 +693,16 @@ def run_job(request_uuid, request_name, cmd, output_dir):
         stdout_text = proc.stdout.decode("utf-8", "ignore") if proc.stdout else ""
         stderr_text = proc.stderr.decode("utf-8", "ignore") if proc.stderr else ""
         log_file    = find_latest_log(output_dir)
+        final_status = "failed" if proc.returncode != 0 else "completed"
+
+        # Channel processors can set overall_status=failed before returning.
+        # Never replace that explicit failure merely because the command exits 0.
+        if proc.returncode == 0 and get_request_overall_status(request_uuid) == "failed":
+            final_status = "failed"
+
         update_request_db(
             request_uuid,
-            overall_status="completed" if proc.returncode == 0 else "failed",
+            overall_status=final_status,
             finished_at=now_str(),
             return_code=proc.returncode,
             stdout_text=stdout_text[-20000:],
@@ -688,7 +710,7 @@ def run_job(request_uuid, request_name, cmd, output_dir):
             log_file=log_file,
         )
 
-        if proc.returncode == 0:
+        if final_status == "completed":
             _persist_filedetails_to_db(request_uuid, request_name, output_dir)
 
     except subprocess.TimeoutExpired:
