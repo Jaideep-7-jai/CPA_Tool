@@ -901,15 +901,17 @@ button { cursor: pointer; border: none; background: none; font: inherit; }
 }
 .form-group input.error-input { border-color: var(--failed); box-shadow: 0 0 0 3px rgba(220,38,38,.1); }
 .input-with-status { position: relative; display: flex; align-items: center; }
-.input-with-status input { padding-right: 36px; width: 100%; }
+.input-with-status input { padding-right: 180px; width: 100%; }
 .name-status {
   position: absolute;
   right: 10px;
   font-size: .78rem;
   font-weight: 700;
 }
-.name-status.ok { color: var(--success); }
+.name-status.available { color: var(--success); }
+.name-status.checking { color: var(--faint); }
 .name-status.taken { color: var(--failed); }
+.name-status.error { color: var(--failed); }
 
 .channel-multi-wrapper {
   display: flex;
