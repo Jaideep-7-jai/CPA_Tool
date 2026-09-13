@@ -80,11 +80,14 @@ from utils import (
 DB_CONFIG = {
     "host": "zds-prod-jbdb3-vip.bo3.e-dialog.com",
     "user": "techuser",
-    "password": "tech12#$",
+    "password": "",
     "database": "CUST_TECH_DB",
     "charset": "utf8mb4",
     "autocommit": True,
 }
+
+FTP_USERNAME = ""
+FTP_PASSWORD = ""
 
 CHANNELS = ["GREEN", "BLUE", "ARCAMAX", "ORANGE"]
 
@@ -266,9 +269,10 @@ def update_request_status(request_id, status, status_column, log):
     raise last_exc
 
 
-def update_ftp_path(request_id, channel_name, ftp_path, log):
+def update_ftp_path(request_id, channel_name, ftp_path, log, record_count=None):
     """
-    Save the FTP file path into the requests table column <CHANNEL>_FTP.
+    Save the FTP file path and, when supplied, final record count into the
+    corresponding requests table columns.
     Uses the same retry logic as update_request_status.
 
     Columns expected in requests table:
@@ -277,22 +281,31 @@ def update_ftp_path(request_id, channel_name, ftp_path, log):
         ARCAMAX_FTP VARCHAR(500)
         ORANGE_FTP  VARCHAR(500)
     """
-    ftp_column = f"{channel_name.upper()}_FTP"
+    channel = channel_name.upper()
+    ftp_column = f"{channel}_FTP"
+    count_column = f"{channel}_FILECOUNT"
     last_exc = None
     for attempt in range(_DB_RETRY_ATTEMPTS):
         try:
             conn = get_db_with_retry(log)
             try:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        f"UPDATE requests SET {ftp_column}=%s WHERE id=%s",
-                        (ftp_path, request_id),
-                    )
+                    if record_count is None:
+                        cur.execute(
+                            f"UPDATE requests SET {ftp_column}=%s WHERE id=%s",
+                            (ftp_path, request_id),
+                        )
+                    else:
+                        cur.execute(
+                            f"UPDATE requests SET {ftp_column}=%s, {count_column}=%s WHERE id=%s",
+                            (ftp_path, str(record_count), request_id),
+                        )
                 conn.commit()
             finally:
                 conn.close()
             log.info(
-                f"DB FTP PATH UPDATE: {ftp_column} -> '{ftp_path}'  "
+                f"DB FTP PATH UPDATE: {ftp_column} -> '{ftp_path}'"
+                f" | {count_column} -> {record_count if record_count is not None else 'unchanged'}  "
                 f"(request_id={request_id})"
             )
             return  # success
@@ -617,7 +630,7 @@ def _post_to_ftp(final_files_dir, path_date, output_file, log):
     """FTP upload from FINAL_FILES/ and verify."""
     ftp_dest = f"/CPA/{path_date}/{output_file}"
     ftp_cmd = (
-        f'lftp -u "GreenPub,Zet@Welcome1!" ftp://zxds-ftp-02.bo3.e-dialog.com '
+        f'lftp -u "{FTP_USERNAME},{FTP_PASSWORD}" ftp://zxds-ftp-02.bo3.e-dialog.com '
         f'-e "mkdir -p /CPA/{path_date};cd /CPA/{path_date};put {output_file};bye"'
     )
     local_path = Path(final_files_dir) / output_file
@@ -769,7 +782,7 @@ def process_green_blue(request_id, channel_name, run_dir: Path):
         _step(log, 7, TOTAL_STEPS, f"FTP upload -> /CPA/{ctx['path_date']}/{ctx['output_file']}", channel_name)
         update_request_status(request_id, "Posting To FTP", channel_status, log)
         ftp_path = _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
-        update_ftp_path(request_id, channel_name, ftp_path, log)
+        update_ftp_path(request_id, channel_name, ftp_path, log, record_count)
         log.info(f"  STEP 7 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path}")
 
         elapsed = time.time() - start_time
@@ -905,7 +918,7 @@ def process_arcamax(request_id, run_dir: Path):
         _step(log, 7, TOTAL_STEPS, f"FTP upload -> /CPA/{ctx['path_date']}/{ctx['output_file']}", channel_name)
         update_request_status(request_id, "Posting To FTP", channel_status, log)
         ftp_path = _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
-        update_ftp_path(request_id, channel_name, ftp_path, log)
+        update_ftp_path(request_id, channel_name, ftp_path, log, record_count)
         log.info(f"  STEP 7 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path}")
 
         elapsed = time.time() - start_time
@@ -1110,7 +1123,7 @@ def process_orange(request_id, run_dir: Path):
         # ── STEP 8/8 ──────────────────────────────────────────────────────
         _step(log, 8, TOTAL_STEPS, f"FTP upload -> /CPA/{path_date}/{output_file}", channel_name)
         ftp_path = _post_to_ftp(final_files_dir, path_date, output_file, log)
-        update_ftp_path(request_id, channel_name, ftp_path, log)
+        update_ftp_path(request_id, channel_name, ftp_path, log, record_count)
         log.info(f"  STEP 8 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path}")
 
         elapsed = time.time() - start_time
