@@ -4,6 +4,7 @@
  *   - Doordash auto-fill (client, criteria, comp type, channel)
  *   - Multi-channel checkbox selection with single-click toggle
  *   - Request name uniqueness check (debounced)
+ *   - Client name uniqueness check for the current day (debounced)
  *   - Criteria value field show/hide
  *   - File upload field show/hide
  *   - Form submission via /api/submit
@@ -18,6 +19,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const nameStatusEl    = document.getElementById('nameStatus');
   const requestTypeEl   = document.getElementById('request_type');
   const clientNameEl    = document.getElementById('client_name');
+  const clientNameStatusEl = document.getElementById('clientNameStatus');
   const criteriaTypeEl  = document.getElementById('criteria_type');
   const compTypeEl      = document.getElementById('comp_type');
 
@@ -137,6 +139,7 @@ document.addEventListener('DOMContentLoaded', () => {
       compTypeEl.removeAttribute('disabled');
       setChannelLock(false);
     }
+    scheduleClientNameCheck();
     updateChannelChoices();
     updateCriteriaFields();
   }
@@ -236,6 +239,57 @@ document.addEventListener('DOMContentLoaded', () => {
     nameCheckTimer = setTimeout(() => checkRequestName(requestNameEl.value.trim()), 500);
   });
 
+  // ── Client name uniqueness check (current day, debounced) ─────────────────
+  let clientNameCheckTimer = null;
+  let clientNameIsValid = false;
+
+  function checkClientName(clientName) {
+    if (!clientName) {
+      clientNameStatusEl.textContent = '';
+      clientNameStatusEl.className = 'name-status';
+      clientNameEl.classList.remove('error-input');
+      clientNameIsValid = false;
+      return;
+    }
+
+    clientNameStatusEl.textContent = 'Checking…';
+    clientNameStatusEl.className = 'name-status checking';
+    clientNameEl.classList.remove('error-input');
+
+    fetch(`/api/check-client-name?client_name=${encodeURIComponent(clientName)}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.available) {
+          clientNameStatusEl.textContent = '✅ Available';
+          clientNameStatusEl.className = 'name-status available';
+          clientNameEl.classList.remove('error-input');
+          clientNameIsValid = true;
+        } else {
+          clientNameStatusEl.textContent = '✖ Already used today';
+          clientNameStatusEl.className = 'name-status taken';
+          clientNameEl.classList.add('error-input');
+          clientNameIsValid = false;
+        }
+      })
+      .catch(() => {
+        clientNameStatusEl.textContent = '⚠ Check failed';
+        clientNameStatusEl.className = 'name-status error';
+        clientNameEl.classList.add('error-input');
+        clientNameIsValid = false;
+      });
+  }
+
+  function scheduleClientNameCheck() {
+    clearTimeout(clientNameCheckTimer);
+    clientNameIsValid = false;
+    clientNameCheckTimer = setTimeout(
+      () => checkClientName(clientNameEl.value.trim()),
+      500,
+    );
+  }
+
+  clientNameEl.addEventListener('input', scheduleClientNameCheck);
+
   // ── Event listeners ────────────────────────────────────────────────────────────
   requestTypeEl.addEventListener('change', applyDoordashDefaults);
   criteriaTypeEl.addEventListener('change', updateCriteriaFields);
@@ -267,6 +321,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
       if (!nameIsValid) {
         formMessage.textContent = '⚠ Please wait for the name check or fix the request name.';
+        formMessage.className   = 'message error';
+        return;
+      }
+
+      if (!clientNameIsValid) {
+        formMessage.textContent = '⚠ Please wait for the client name check or use a different client name.';
         formMessage.className   = 'message error';
         return;
       }
@@ -321,6 +381,10 @@ document.addEventListener('DOMContentLoaded', () => {
         updateCriteriaFields();
         nameIsValid = false;
         nameStatusEl.textContent = '';
+        clientNameIsValid = false;
+        clientNameStatusEl.textContent = '';
+        clientNameStatusEl.className = 'name-status';
+        clientNameEl.classList.remove('error-input');
 
         formMessage.textContent = `✅ Request "${data.request_name}" submitted successfully!`;
         formMessage.className   = 'message success';
