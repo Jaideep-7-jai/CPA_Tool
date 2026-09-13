@@ -78,16 +78,17 @@ from utils import (
 )
 
 DB_CONFIG = {
-    "host": "zds-prod-jbdb3-vip.bo3.e-dialog.com",
-    "user": "techuser",
+    "host": "",
+    "user": "",
     "password": "",
-    "database": "CUST_TECH_DB",
+    "database": "",
     "charset": "utf8mb4",
     "autocommit": True,
 }
 
 FTP_USERNAME = ""
 FTP_PASSWORD = ""
+FTP_HOST = ""
 
 CHANNELS = ["GREEN", "BLUE", "ARCAMAX", "ORANGE"]
 
@@ -630,7 +631,7 @@ def _post_to_ftp(final_files_dir, path_date, output_file, log):
     """FTP upload from FINAL_FILES/ and verify."""
     ftp_dest = f"/CPA/{path_date}/{output_file}"
     ftp_cmd = (
-        f'lftp -u "{FTP_USERNAME},{FTP_PASSWORD}" ftp://zxds-ftp-02.bo3.e-dialog.com '
+        f'lftp -u "{FTP_USERNAME},{FTP_PASSWORD}" ftp://{FTP_HOST} '
         f'-e "mkdir -p /CPA/{path_date};cd /CPA/{path_date};put {output_file};bye"'
     )
     local_path = Path(final_files_dir) / output_file
@@ -1303,6 +1304,10 @@ def process_age_state_request(request_id, channel="ALL"):
             f"Request {request_id} completed",
             f"Channels: {', '.join(channels_to_run)}\nResults: {results}",
             run_dir
+        )
+    else:
+        raise RuntimeError(
+            f"Age/state request failed for channel(s): {', '.join(failed)}"
         )
 
     return results
