@@ -31,7 +31,7 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 DB_CONFIG = {
     "host": "zds-prod-jbdb3-vip.bo3.e-dialog.com",
     "user": "techuser",
-    "password": "tech12#$",
+    "password": "",
     "database": "CUST_TECH_DB",
     "charset": "utf8mb4",
     "autocommit": True,
@@ -280,6 +280,28 @@ def is_request_name_taken(name):
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM requests WHERE request_name=%s", (name,))
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def is_client_name_taken_today(client_name):
+    """Return whether the client name is already used on the DB server's current day."""
+    normalized_name = client_name.strip()
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM requests
+                WHERE LOWER(TRIM(client_name)) = LOWER(TRIM(%s))
+                  AND created_at >= CURDATE()
+                  AND created_at < CURDATE() + INTERVAL 1 DAY
+                LIMIT 1
+                """,
+                (normalized_name,),
+            )
             return cur.fetchone() is not None
     finally:
         conn.close()
@@ -883,6 +905,16 @@ def api_check_name():
     return jsonify({'available': not taken})
 
 
+@app.route('/api/check-client-name')
+@login_required
+def api_check_client_name():
+    client_name = request.args.get('client_name', '').strip()
+    if not client_name:
+        return jsonify({'available': False, 'error': 'Client Name is empty'})
+    taken = is_client_name_taken_today(client_name)
+    return jsonify({'available': not taken})
+
+
 
 @app.route('/api/requests')
 @login_required
@@ -961,6 +993,14 @@ def submit_request():
         criteria_type = 'zips'
         comp_type     = 'include'
         channel_list  = ['ALL']
+
+    if not client_name:
+        return jsonify({'ok': False, 'error': 'Client Name is required.'}), 400
+    if is_client_name_taken_today(client_name):
+        return jsonify({
+            'ok': False,
+            'error': f'Client name "{client_name}" was already used today. Please use a different client name.'
+        }), 400
 
     if criteria_type == 'age' and comp_type not in {'greater', 'less'}:
         return jsonify({'ok': False, 'error': 'Age criteria requires comp type greater or less.'}), 400
