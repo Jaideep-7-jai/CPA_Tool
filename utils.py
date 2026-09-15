@@ -293,85 +293,149 @@ def _format_size_bytes(size_bytes):
         return f"{size_bytes / 1024 ** 3:.1f} GB"
 
 
-def send_success_email(subject, results, run_dir):
-    """
-    Success email with rich per-file details.
+def _request_summary(request_details):
+    """Return a readable request summary for notification emails."""
+    request_details = request_details or {}
+    fields = (
+        ("Request ID", request_details.get("id", "")),
+        ("Request Name", request_details.get("request_name", "")),
+        ("Client Name", request_details.get("client_name", "")),
+        ("Request Type", request_details.get("request_type", "")),
+        ("Criteria Type", request_details.get("criteria_type", "")),
+        ("Criteria Value", request_details.get("criteria_value", "")),
+        ("Comparison", request_details.get("comp_type", "")),
+        ("Channels", request_details.get("channel", "")),
+        ("Output Directory", request_details.get("output_dir", "")),
+    )
+    return "\n".join(
+        f"{label}: {value or '-'}"
+        for label, value in fields
+    )
 
-    Steps performed:
-    1. Scan <run_dir>/FINAL_FILES/ to collect real file names, row counts
-       and file sizes in bytes.
-    2. Merge row_count / channel from the `results` dict.
-    3. Write <run_dir>/logs/filedetails.json  (persists for audit and DB
-       upsert which is handled by app.py:_persist_filedetails_to_db after
-       the subprocess returns).
-    4. Build the email body by reading from filedetails.json (so mail
-       content is always consistent with what was persisted to disk/DB).
-    5. Send the email.
 
-    Parameters
-    ----------
-    subject   : str   – email subject (e.g. "Request 43 completed")
-    results   : dict  – channel -> result dict from process_age_state_request()
-    run_dir   : str or Path – the run directory (contains FINAL_FILES/ and logs/)
+def _request_subject(status, request_details):
+    request_details = request_details or {}
+    request_name = request_details.get("request_name") or "Unknown Request"
+    request_id = request_details.get("id") or "Unknown ID"
 
-    Returns
-    -------
-    file_details : list  – list of file-detail dicts (also written to JSON + DB)
-    json_path    : Path  – path to the written filedetails.json
-    """
-    run_dir_path    = Path(run_dir)
+    return f"CPA Tool {status} | Request: {request_name} | ID: {request_id}"
+
+
+def _latest_log_details(run_dir, max_chars=20000):
+    """Return the latest request log contents for an error notification."""
+    if not run_dir:
+        return "No request log directory was supplied."
+
+    logs_dir = Path(run_dir) / "logs"
+    if not logs_dir.exists():
+        return f"No log directory found at: {logs_dir}"
+
+    log_files = sorted(
+        logs_dir.glob("*.log"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not log_files:
+        return f"No log files found in: {logs_dir}"
+
+    latest_log = log_files[0]
+
+    try:
+        with open(str(latest_log), "r", errors="replace") as log_file:
+            content = log_file.read()
+
+        if len(content) > max_chars:
+            content = "[Earlier log content omitted]\n" + content[-max_chars:]
+
+        return f"Log File: {latest_log}\n\n{content}"
+
+    except Exception as exc:
+        return f"Could not read log file {latest_log}: {exc}"
+
+
+def send_success_email(request_details, results, run_dir):
+    """Send a success email with request and generated-file details."""
+    run_dir_path = Path(run_dir)
     final_files_dir = run_dir_path / "FINAL_FILES"
-    logs_dir        = run_dir_path / "logs"
+    logs_dir = run_dir_path / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── 1. Build file details list ─────────────────────────────
     file_details = build_file_details_json(final_files_dir, results)
 
-    # ── 2. Write filedetails.json to logs/ ────────────────────
     json_path = logs_dir / "filedetails.json"
     try:
-        with open(str(json_path), "w") as jf:
-            json.dump(file_details, jf, indent=2)
+        with open(str(json_path), "w") as json_file:
+            json.dump(file_details, json_file, indent=2)
         logging.info(f"filedetails.json written -> {json_path}")
-    except Exception as e:
-        logging.error(f"Failed to write filedetails.json: {e}")
+    except Exception as exc:
+        logging.error(f"Failed to write filedetails.json: {exc}")
 
-    # ── 3. Read back from JSON file for email body ─────────────
-    email_file_details = _read_filedetails_json(json_path) if json_path.exists() else file_details
+    email_file_details = (
+        _read_filedetails_json(json_path)
+        if json_path.exists()
+        else file_details
+    )
 
-    # ── 4. Build email body ────────────────────────────────────
     if email_file_details:
         lines = []
-        for fd in email_file_details:
-            ch_tag     = f"[{fd['channel']}] " if fd.get('channel') else ""
-            row_count  = fd.get('file_count', fd.get('row_count', 0)) or 0
-            size_bytes = fd.get('file_size_bytes', 0) or 0
-            size_str   = _format_size_bytes(size_bytes)
+
+        for file_detail in email_file_details:
+            channel_tag = (
+                f"[{file_detail['channel']}] "
+                if file_detail.get("channel")
+                else ""
+            )
+            row_count = (
+                file_detail.get("file_count",
+                                file_detail.get("row_count", 0))
+                or 0
+            )
+            size_bytes = file_detail.get("file_size_bytes", 0) or 0
+            size_text = _format_size_bytes(size_bytes)
+
             lines.append(
-                f"  . {ch_tag}{fd['filename']}"
+                f"  . {channel_tag}{file_detail['filename']}"
                 f"  |  Rows: {row_count:,}"
-                f"  |  Size: {size_str}"
+                f"  |  Size: {size_text}"
                 f"  |  Raw bytes: {size_bytes:,}"
             )
+
         file_section = "\n".join(lines)
     else:
         file_section = "(no files found in FINAL_FILES directory)"
 
-    body = f"""SUCCESS: {subject}
+    subject = _request_subject("COMPLETED", request_details)
+
+    body = f"""SUCCESS: Request completed successfully
+
+Request Details:
+{_request_summary(request_details)}
 
 Output Directory: {final_files_dir}
 
-Generated files:
+Generated Files:
 {file_section}
 
 Processing completed successfully!"""
 
     send_email(subject, body, is_error=False)
-    # Return both so callers that need the data or path can use them
+
     return file_details, json_path
 
 
-def send_error_email(subject, error_msg):
-    """Error email"""
-    body = f"ERROR: {subject}\n\n{error_msg}"
+def send_error_email(request_details, error_msg, run_dir=None):
+    """Send an error email with request metadata, error details, and log output."""
+    subject = _request_subject("FAILED", request_details)
+
+    body = f"""ERROR: Request failed
+
+Request Details:
+{_request_summary(request_details)}
+
+Error Details:
+{error_msg}
+
+Error Log Details:
+{_latest_log_details(run_dir)}"""
+
     send_email(subject, body, is_error=True)

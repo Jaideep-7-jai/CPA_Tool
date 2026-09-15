@@ -272,19 +272,22 @@ def process_doordash_zip_request(request_id: int, zip_file: str, channel, output
 
     total_records = sum(v.get("count", 0) for v in results.values() if isinstance(v, dict))
     if errors:
-        error_summary = "\n".join(f"{channel_name}: {error}" for channel_name, error in errors)
-        send_error_email("DOORDASH ZIP FAILURE", error_summary)
+        error_summary = "\n".join(
+            f"{channel_name}: {error}"
+            for channel_name, error in errors
+        )
+        send_error_email(request_data, error_summary, run_dir)
         raise RuntimeError(f"Doordash request failed:\n{error_summary}")
+    
+    notification_results = {
+        **results,
+        **{
+            output["channel"]: output
+            for output in combined_outputs
+        },
+    }
 
-    files = [
-        v["file"] for v in results.values()
-        if isinstance(v, dict) and v.get("file")
-    ] + [v["file"] for v in combined_outputs]
-    send_success_email(
-        f"DOORDASH ZIP REQUEST COMPLETE — {total_records:,} matched",
-        files,
-        str(run_dir),
-    )
+send_success_email(request_data, notification_results, run_dir)
 
 
 if __name__ == "__main__":

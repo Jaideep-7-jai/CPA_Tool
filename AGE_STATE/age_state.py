@@ -810,7 +810,7 @@ def process_green_blue(request_id, channel_name, run_dir: Path):
             f"{channel_name} processing FAILED at the above step. "
             f"Exception: {exc}"
         )
-        send_error_email(f"{channel_name} Processing Failed", str(exc))
+        send_error_email(ctx["request_data"], str(exc), run_dir)
         raise
 
 
@@ -946,7 +946,7 @@ def process_arcamax(request_id, run_dir: Path):
             f"ARCAMAX processing FAILED at the above step. "
             f"Exception: {exc}"
         )
-        send_error_email("ARCAMAX Processing Failed", str(exc))
+        send_error_email(ctx["request_data"], str(exc), run_dir)
         raise
 
 
@@ -1151,7 +1151,7 @@ def process_orange(request_id, run_dir: Path):
             f"ORANGE processing FAILED at the above step. "
             f"Exception: {exc}"
         )
-        send_error_email("ORANGE Processing Failed", str(exc))
+        send_error_email(ctx["request_data"], str(exc), run_dir)
         raise
 
 
@@ -1300,11 +1300,7 @@ def process_age_state_request(request_id, channel="ALL"):
     log_main.info("=" * 70)
 
     if not failed:
-        send_success_email(
-            f"Request {request_id} completed",
-            f"Channels: {', '.join(channels_to_run)}\nResults: {results}",
-            run_dir
-        )
+        send_success_email(request_data, results, run_dir)
     else:
         raise RuntimeError(
             f"Age/state request failed for channel(s): {', '.join(failed)}"

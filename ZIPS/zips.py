@@ -1298,20 +1298,20 @@ def process_zip_request(
 
     if errors:
         send_error_email(
-            f"ZIP PARTIAL FAILURE — {len(errors)} channel(s) failed",
-            "\n".join(f"{c}: {e}" for c, e in errors),
+            request_data,
+            "\n".join(f"{channel}: {error}" for channel, error in errors),
+            run_dir,
         )
     else:
-        send_success_email(
-            f"ZIP REQUEST COMPLETE — {total_records:,} matched",
-            [v.get("file") for v in results.values() if isinstance(v, dict)],
-            str(run_dir),
-        )
-
+        send_success_email(request_data, results, run_dir)
+    
     if errors:
         raise RuntimeError(
             "ZIP request failed for channel(s): "
-            + "; ".join(f"{channel}: {error}" for channel, error in errors)
+            + "; ".join(
+                f"{channel}: {error}"
+                for channel, error in errors
+            )
         )
 
 
