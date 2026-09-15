@@ -17,7 +17,7 @@ from typing import List, Dict, Optional, Union
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from config import DB_CONFIG, SENDER, RECIPIENT, CC_RECIPIENTS
+from config import DB_CONFIG, SENDER, RECIPIENT, CC_RECIPIENTS, CPAUSER_EMAIL, TECH_NOTIFICATION_RECIPIENTS
 
 def ensure_output_dir(output_dir, criteria_type):
     """
@@ -146,27 +146,51 @@ def get_db_connection(channel):
     return config
 
 
-def send_email(subject, body_text, is_error=False):
-    """Email notification"""
+def send_email(subject, body_text, recipients, is_error=False):
+    """Send an email to the supplied notification recipients."""
     try:
-        msg = MIMEMultipart()
-        msg['Subject'] = f"[{'ERROR' if is_error else 'SUCCESS'}] {subject}"
-        msg['From'] = SENDER
-        msg['To'] = RECIPIENT
-        msg['Cc'] = CC_RECIPIENTS
+        recipients = [
+            recipient.strip()
+            for recipient in recipients
+            if recipient and recipient.strip()
+        ]
 
-        msg_body = MIMEMultipart('alternative')
-        textpart = MIMEText(body_text, 'plain')
-        msg_body.attach(textpart)
+        if not recipients:
+            logging.warning("Email was not sent because no recipients were configured.")
+            return
+
+        msg = MIMEMultipart()
+        msg["Subject"] = f"[{'ERROR' if is_error else 'SUCCESS'}] {subject}"
+        msg["From"] = SENDER
+        msg["To"] = ", ".join(recipients)
+
+        msg_body = MIMEMultipart("alternative")
+        msg_body.attach(MIMEText(body_text, "plain"))
         msg.attach(msg_body)
 
-        all_recipients = [RECIPIENT] + CC_RECIPIENTS.split(',')
-        server = smtplib.SMTP('localhost')
-        server.sendmail(SENDER, all_recipients, msg.as_string())
+        server = smtplib.SMTP("localhost")
+        server.sendmail(SENDER, recipients, msg.as_string())
         server.quit()
-        logging.info(f"{'ERROR' if is_error else 'SUCCESS'} email: {subject}")
-    except Exception as e:
-        logging.error(f"Email failed: {e}")
+
+        logging.info(
+            f"{'ERROR' if is_error else 'SUCCESS'} email sent: {subject}"
+        )
+
+    except Exception as exc:
+        logging.error(f"Email failed: {exc}")
+
+
+def _success_recipients(request_details):
+    created_by = (
+        request_details.get("created_by_username", "")
+        .strip()
+        .lower()
+    )
+
+    if created_by == "cpauser":
+        return [CPAUSER_EMAIL]
+
+    return TECH_NOTIFICATION_RECIPIENTS
 
 
 def _count_rows_in_file(filepath):
@@ -418,7 +442,12 @@ Generated Files:
 
 Processing completed successfully!"""
 
-    send_email(subject, body, is_error=False)
+    send_email(
+    subject,
+    body,
+    recipients=_success_recipients(request_details),
+    is_error=False,
+    )
 
     return file_details, json_path
 
@@ -438,4 +467,9 @@ Error Details:
 Error Log Details:
 {_latest_log_details(run_dir)}"""
 
-    send_email(subject, body, is_error=True)
+    send_email(
+    subject,
+    body,
+    recipients=TECH_NOTIFICATION_RECIPIENTS,
+    is_error=True,
+    )

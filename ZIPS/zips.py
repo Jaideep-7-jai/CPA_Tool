@@ -183,16 +183,18 @@ def fetch_request_details(request_id):
             cur.execute(
                 """
                 SELECT
-                    id,
-                    client_name,
-                    request_type,
-                    request_name,
-                    criteria_type,
-                    criteria_value,
-                    comp_type,
-                    output_dir
-                FROM requests
-                WHERE id=%s
+                    r.id,
+                    r.client_name,
+                    r.request_type,
+                    r.request_name,
+                    r.criteria_type,
+                    r.criteria_value,
+                    r.comp_type,
+                    r.output_dir,
+                    u.username AS created_by_username
+                FROM requests r
+                JOIN users u ON u.id = r.created_by
+                WHERE r.id=%s
                 """,
                 (request_id,),
             )
