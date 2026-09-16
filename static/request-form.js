@@ -296,10 +296,11 @@ document.addEventListener('DOMContentLoaded', () => {
   // ── Show/hide criteria value + file upload ──────────────────────────────────
   function updateCriteriaFields() {
     const criteria   = criteriaTypeEl.value;
-    const isZipsOrDD = criteria === 'zips';
+    const isZips     = criteria === 'zips';
+    const isDoordash = requestTypeEl.value === 'Doordash';
     const isAge      = criteria === 'age';
 
-    if (isZipsOrDD) {
+    if (isZips || isDoordash) {
       criteriaValueGroup.classList.add('hidden');
       criteriaValueEl.removeAttribute('required');
       criteriaValueEl.value = '';
@@ -319,10 +320,12 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     }
 
-    if (isZipsOrDD) {
-      fileUploadGroup.classList.remove('hidden');
-    } else {
-      fileUploadGroup.classList.add('hidden');
+    const doordashZipFile = document.getElementById('zip_file');
+    if (fileUploadGroup && doordashZipFile) {
+      fileUploadGroup.classList.toggle('hidden', !isDoordash);
+      doordashZipFile.disabled = !isDoordash;
+      doordashZipFile.required = isDoordash;
+      if (!isDoordash) doordashZipFile.value = '';
     }
 
     updateCompTypeOptions(criteria);
