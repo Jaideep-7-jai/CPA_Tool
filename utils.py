@@ -270,6 +270,7 @@ def build_file_details_json(final_files_dir, results=None):
                 "row_count":       row_count,         # kept for backward compat
                 "file_size_bytes": file_size_bytes,   # raw file size in bytes
                 "channel":         result_entry.get('channel', ''),
+                "merge_mode":      result_entry.get('merge_mode', ''),
                 "path":            str(fp),
                 "s3_path":         result_entry.get("s3_path", ""),
             })
@@ -416,12 +417,18 @@ def send_success_email(request_details, results, run_dir):
             )
             size_bytes = file_detail.get("file_size_bytes", 0) or 0
             size_text = _format_size_bytes(size_bytes)
+            merge_note = (
+                "  |  Merged with previous request"
+                if file_detail.get("merge_mode") == "MERGED"
+                else "  |  Current output"
+            )
 
             lines.append(
                 f"  . {channel_tag}{file_detail['filename']}"
                 f"  |  Rows: {row_count:,}"
                 f"  |  Size: {size_text}"
                 f"  |  Raw bytes: {size_bytes:,}"
+                f"{merge_note}"
             )
 
         file_section = "\n".join(lines)
