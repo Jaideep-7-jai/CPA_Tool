@@ -14,6 +14,7 @@ import pandas as pd
 
 from config import AWS_KEY_ID, AWS_SECRET_KEY, S3_BASE
 from utils import ensure_output_dir, run_command, send_error_email, send_success_email
+from MERGE_OUTPUT.merge_output import merge_current_file
 from AGE_STATE.age_state import (
     get_dob_cutoff,
     setup_channel_logging,
@@ -270,27 +271,32 @@ def _process_channel(request_data, criteria, zip_staging_table, run_dir, channel
         new_file = temp_dir / basename
         _download_and_combine(s3_final, temp_dir / "download", temp_dir, basename, channel, log)
         if request_data.get("merge_source_request_id"):
-            previous_s3 = _fetch_previous_path(request_data["merge_source_request_id"], channel)
-            previous_file = temp_dir / ("previous_" + basename)
-            _download_and_combine(previous_s3, temp_dir / "previous_download", temp_dir, previous_file.name, channel, log)
-            count = _merge_csv(new_file, previous_file, channel)
+            merge_result = merge_current_file(
+                request_id, request_data["merge_source_request_id"], channel, new_file,
+                s3_final, temp_dir, log, orange=(channel == "ORANGE")
+            )
+            count = merge_result["count"]
+            merge_mode = merge_result["merge_mode"]
+            output_s3 = merge_result["s3_path"]
         else:
             count = len(pd.read_csv(str(new_file), sep="|", dtype=str))
+            merge_mode = "CURRENT_ONLY"
+            output_s3 = s3_final
         final_file = final_dir / basename
         shutil.move(str(new_file), str(final_file))
         upload_file = basename
         if channel == "ORANGE" and request_data["request_type"] == "Mailing":
             upload_file = _orange_mailing_zip(final_file, final_dir)
-        merged_s3 = s3_final + "/MERGED"
-        run_command(["aws", "s3", "cp", str(final_file), merged_s3 + "/" + basename, "--quiet"])
+        if merge_mode == "CURRENT_ONLY":
+            update_channel_storage(request_id, channel, output_s3, count, log)
         ftp_path = _post_to_ftp(final_dir, date_value, upload_file, log)
         update_ftp_path(request_id, channel, ftp_path, log, count)
-        update_channel_storage(request_id, channel, merged_s3, count, log)
         update_request_status(request_id, "Completed", channel + "_STATUS", log)
         return {
             "channel": channel, "status": "SUCCESS", "file": upload_file,
             "final_file_path": str(final_dir / upload_file), "ftp_path": ftp_path,
-            "s3_path": merged_s3, "count": count, "elapsed": time.time() - started,
+            "s3_path": output_s3, "count": count, "merge_mode": merge_mode,
+            "elapsed": time.time() - started,
         }
     except Exception:
         update_request_status(request_id, "Failed", channel + "_STATUS", log)
