@@ -99,6 +99,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function addCriterion(type = 'age') {
+    if (criteriaRows.length >= 3) return;
     const row = document.createElement('div');
     row.className = 'criteria-row';
     row.innerHTML = `
@@ -109,7 +110,10 @@ document.addEventListener('DOMContentLoaded', () => {
     criteriaBuilder.appendChild(row);
     criteriaRows.push(row);
     renderCriterionValue(row);
-    row.querySelector('.criteria-kind').addEventListener('change', () => renderCriterionValue(row));
+    row.querySelector('.criteria-kind').addEventListener('change', () => {
+      renderCriterionValue(row);
+      updateCriteriaControls();
+    });
     row.querySelector('.criteria-comparison').addEventListener('change', () => {
       if (row.querySelector('.criteria-kind').value === 'age' && row.querySelector('.criteria-comparison').value === 'between') {
         row.querySelector('.criteria-row-value').innerHTML = '<input class="age-from" type="number" min="0" placeholder="From age"><input class="age-to" type="number" min="0" placeholder="To age">';
@@ -130,7 +134,22 @@ document.addEventListener('DOMContentLoaded', () => {
       if (criteriaRows.length === 1) return;
       criteriaRows.splice(criteriaRows.indexOf(row), 1);
       row.remove();
+      updateCriteriaControls();
       syncCriteriaJson();
+    });
+    updateCriteriaControls();
+  }
+
+  function updateCriteriaControls() {
+    if (!addCriteriaBtn) return;
+    const selectedTypes = criteriaRows.map(row => row.querySelector('.criteria-kind').value);
+    addCriteriaBtn.disabled = criteriaRows.length >= 3;
+    addCriteriaBtn.classList.toggle('hidden', criteriaRows.length >= 3);
+    criteriaRows.forEach(row => {
+      const select = row.querySelector('.criteria-kind');
+      Array.from(select.options).forEach(option => {
+        option.disabled = option.value !== select.value && selectedTypes.includes(option.value);
+      });
     });
   }
 
@@ -245,8 +264,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (criteriaBuilderGroup) {
       criteriaBuilderGroup.classList.toggle('hidden', isDoordash);
+      const mergeGroup = mergeEnabledEl ? mergeEnabledEl.closest('.form-group') : null;
+      if (mergeGroup) mergeGroup.classList.toggle('hidden', isDoordash);
       if (isDoordash) {
         criteriaJsonEl.value = '';
+        mergeEnabledEl.checked = false;
+        mergeRequestFields.classList.add('hidden');
+        document.getElementById('merge_source_request_name').value = '';
       } else {
         syncCriteriaJson();
       }
