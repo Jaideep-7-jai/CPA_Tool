@@ -76,6 +76,8 @@ from utils import (
     send_error_email,
     ensure_output_dir,
 )
+from MERGE_OUTPUT.merge_output import merge_current_file
+from ZIPS.zips import update_channel_storage
 
 DB_CONFIG = {
     "host": "",
@@ -222,7 +224,8 @@ def fetch_request_details(request_id):
                     comp_type,
                     output_dir,
                     responder_match,
-                    responder_days
+                    responder_days,
+                    merge_source_request_id
                 FROM requests
                 WHERE id=%s
                 """,
@@ -454,7 +457,7 @@ def _download_and_combine(s3_path, download_dir, work_dir,
             )
     else:
         run_command(
-            f"printf 'email\n' > {shlex.quote(str(out_path))} && "
+            f"printf 'email_address|account_name\n' > {shlex.quote(str(out_path))} && "
             f"zcat {shlex.quote(str(download_dir) + '/')}data* "
             f"| sed 's/\"//g' | tail -n +2 >> {shlex.quote(str(out_path))}"
             )
@@ -819,6 +822,14 @@ def process_green_blue(request_id, channel_name, run_dir: Path):
         final_file_path = final_files_dir / ctx["output_file"]
         shutil.move(str(tmp_file_path), str(final_file_path))
         record_count = _count_file_lines(str(final_file_path))
+        update_channel_storage(request_id, channel_name, path_FINAL, record_count, log)
+        merge_mode = ""
+        if ctx["request_data"].get("merge_source_request_id"):
+            merge_result = merge_current_file(
+                request_id, ctx["request_data"]["merge_source_request_id"], channel_name,
+                final_file_path, path_FINAL, channel_tmp, log
+            )
+            record_count, merge_mode = merge_result["count"], merge_result["merge_mode"]
         log.info(
             f"  STEP 6 DONE: Final file -> FINAL_FILES/{ctx['output_file']}\n"
             f"               Distinct email rows in final file: {record_count:,}"
@@ -846,6 +857,7 @@ def process_green_blue(request_id, channel_name, run_dir: Path):
             channel_name, ctx["output_file"],
             str(final_file_path), elapsed, record_count
         )
+        result["merge_mode"] = merge_mode
         _cleanup_channel_tmp(channel_tmp, log)
         return result
 
@@ -957,6 +969,14 @@ def process_arcamax(request_id, run_dir: Path):
         final_file_path = final_files_dir / ctx["output_file"]
         shutil.move(str(tmp_file_path), str(final_file_path))
         record_count = _count_file_lines(str(final_file_path))
+        update_channel_storage(request_id, channel_name, path_FINAL, record_count, log)
+        merge_mode = ""
+        if ctx["request_data"].get("merge_source_request_id"):
+            merge_result = merge_current_file(
+                request_id, ctx["request_data"]["merge_source_request_id"], channel_name,
+                final_file_path, path_FINAL, channel_tmp, log
+            )
+            record_count, merge_mode = merge_result["count"], merge_result["merge_mode"]
         log.info(
             f"  STEP 6 DONE: Final file -> FINAL_FILES/{ctx['output_file']}\n"
             f"               Distinct email rows in final file: {record_count:,}"
@@ -984,6 +1004,7 @@ def process_arcamax(request_id, run_dir: Path):
             channel_name, ctx["output_file"],
             str(final_file_path), elapsed, record_count
         )
+        result["merge_mode"] = merge_mode
         _cleanup_channel_tmp(channel_tmp, log)
         return result
 
@@ -1092,14 +1113,23 @@ def process_orange(request_id, run_dir: Path):
         combined_count = _download_and_combine(
             path_FINAL, download_dir, channel_tmp, raw_combined, channel_name, log
         )
+        raw_file_path = channel_tmp / raw_combined
+        update_channel_storage(request_id, channel_name, path_FINAL, combined_count, log)
+        merge_mode = ""
+        if ctx["request_data"].get("merge_source_request_id"):
+            merge_result = merge_current_file(
+                request_id, ctx["request_data"]["merge_source_request_id"], channel_name,
+                raw_file_path, path_FINAL, channel_tmp, log
+            )
+            combined_count, merge_mode = merge_result["count"], merge_result["merge_mode"]
         log.info(f"  STEP 5 DONE: Combined raw rows downloaded: {combined_count:,}")
 
         # ── STEP 6/8 ──────────────────────────────────────────────────────
         _step(log, 6, TOTAL_STEPS, "Loading combined file into DataFrame for processing", channel_name)
         df_final = pd.read_csv(
-            str(channel_tmp / raw_combined),
+            str(raw_file_path),
             sep="|",
-            header=None,
+            header=0,
             names=["email_address", "account_name"],
             dtype=str,
         )
@@ -1191,6 +1221,7 @@ def process_orange(request_id, run_dir: Path):
             channel_name, output_file,
             final_file_path, elapsed, record_count
         )
+        result["merge_mode"] = merge_mode
         _cleanup_channel_tmp(channel_tmp, log)
         return result
 
