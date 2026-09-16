@@ -50,7 +50,8 @@ def _fetch_request(request_id):
                 """
                 SELECT r.id, r.request_name, r.client_name, r.request_type,
                        r.channel, r.output_dir, r.criteria_json,
-                       r.merge_source_request_id, u.username
+                       r.merge_source_request_id, r.responder_match,
+                       r.responder_days, u.username
                 FROM requests r
                 JOIN users u ON u.id = r.created_by
                 WHERE r.id=%s
@@ -64,7 +65,8 @@ def _fetch_request(request_id):
                 "id": row[0], "request_name": row[1], "client_name": row[2],
                 "request_type": row[3], "channel": row[4], "output_dir": row[5],
                 "criteria_json": row[6], "merge_source_request_id": row[7],
-                "created_by_username": row[8], "criteria_type": "multi",
+                "responder_match": bool(row[8]), "responder_days": row[9],
+                "created_by_username": row[10], "criteria_type": "multi",
                 "criteria_value": "Multiple criteria (OR)", "comp_type": "include",
             }
     finally:
@@ -141,17 +143,43 @@ def _criteria_conditions(channel, criteria, zip_staging_table):
     return "(" + " OR ".join(conditions) + ")"
 
 
-def _create_channel_table(perm_table, channel, criteria, zip_staging_table, log):
+def _responder_join(channel, responder_match, responder_days):
+    """Return the optional, deduplicated responder join for one channel."""
+    if not responder_match or channel not in ("GREEN", "BLUE", "ORANGE"):
+        return ""
+    days = int(responder_days or 0)
+    if days < 1:
+        raise ValueError("Responder Match requires responder_days to be at least 1.")
+    if channel in ("GREEN", "BLUE"):
+        return (
+            "JOIN (SELECT DISTINCT LOWER(TRIM(emailid)) AS email "
+            "FROM GREEN.GREEN_LPT.RAW_OPENS_FOLLOWUP "
+            "WHERE opendate >= DATEADD(day, -{0}, CURRENT_DATE())) responders "
+            "ON LOWER(TRIM(a.email)) = responders.email ".format(days)
+        )
+    return (
+        "JOIN (SELECT DISTINCT LOWER(TRIM(email)) AS email "
+        "FROM GREEN.DT_DATA.APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND "
+        "WHERE OPEN_DATE >= DATEADD(day, -{0}, CURRENT_DATE())) responders "
+        "ON LOWER(TRIM(a.email_address)) = responders.email ".format(days)
+    )
+
+
+def _create_channel_table(perm_table, channel, criteria, zip_staging_table,
+                          responder_match, responder_days, log):
     condition = _criteria_conditions(channel, criteria, zip_staging_table)
     if channel in ("GREEN", "BLUE"):
         profile_table = "GREEN_LPT.UNIVERSAL_PROFILE" if channel == "GREEN" else "INFS_LPT.INFS_PROFILE"
+        responder_join = _responder_join(channel, responder_match, responder_days)
         sql = (
             "CREATE OR REPLACE TABLE {perm} AS "
             "SELECT a.email, b.ZIP FROM {profile} a "
             "JOIN APT_CUSTOM_GREEN_REA_DATA_DND b ON a.md5hash=b.EMAIL_MD5 "
+            "{responder_join}"
             "WHERE {condition};"
-        ).format(perm=perm_table, profile=profile_table, condition=condition)
+        ).format(perm=perm_table, profile=profile_table, responder_join=responder_join, condition=condition)
     elif channel == "ARCAMAX":
+        responder_join = _responder_join(channel, responder_match, responder_days)
         sql = (
             "CREATE OR REPLACE TABLE {perm} AS "
             "SELECT email, ZIP FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
@@ -165,10 +193,10 @@ def _create_channel_table(perm_table, channel, criteria, zip_staging_table, log)
             "JOIN APT_ADHOC_JAIDEEP_ZIP_ESP_DETAILS_INCLUDE_ORANGE_20260604 esp "
             "ON a.FEED_ID=esp.FEEDID "
             "JOIN APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND p ON a.email_address=p.email_address "
-            "JOIN APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND d ON a.email_address=d.email "
+            "{responder_join}"
             "WHERE {condition} "
             "QUALIFY ROW_NUMBER() OVER (PARTITION BY a.email_address ORDER BY a.created_at DESC)=1;"
-        ).format(perm=perm_table, condition=condition)
+        ).format(perm=perm_table, responder_join=responder_join, condition=condition)
 
     log.info("Multi-criteria OR condition: %s", condition)
     run_command(["snowsql", "-c", "datateam1", "-q", sql])
@@ -229,7 +257,10 @@ def _process_channel(request_data, criteria, zip_staging_table, run_dir, channel
     s3_complete = s3_final.replace("_FINAL", "_COMPLETE")
     started = time.time()
     try:
-        count = _create_channel_table(perm_table, channel, criteria, zip_staging_table, log)
+        count = _create_channel_table(
+            perm_table, channel, criteria, zip_staging_table,
+            request_data.get("responder_match"), request_data.get("responder_days"), log
+        )
         if count == 0:
             update_request_status(request_id, "No Data Retrieved", channel + "_STATUS", log)
             _drop_perm_table(perm_table, log)
