@@ -98,12 +98,17 @@ document.addEventListener('DOMContentLoaded', () => {
     syncCriteriaJson();
   }
 
-  function addCriterion(type = 'age') {
+  function addCriterion(type = null) {
     if (criteriaRows.length >= 3) return;
+    const selectedTypes = criteriaRows.map(row => row.querySelector('.criteria-kind').value);
+    const criterionType = type || ['age', 'state', 'zips'].find(
+      candidate => !selectedTypes.includes(candidate)
+    );
+    if (!criterionType || selectedTypes.includes(criterionType)) return;
     const row = document.createElement('div');
     row.className = 'criteria-row';
     row.innerHTML = `
-      <select class="criteria-kind">${criterionOptions(type)}</select>
+      <select class="criteria-kind">${criterionOptions(criterionType)}</select>
       <select class="criteria-comparison"></select>
       <div class="criteria-row-value"></div>
       <button type="button" class="remove-criteria" title="Remove criterion"><i class="bi bi-trash"></i></button>`;
@@ -160,7 +165,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   if (criteriaBuilder) {
     addCriterion('age');
-    addCriteriaBtn.addEventListener('click', () => addCriterion('state'));
+    addCriteriaBtn.addEventListener('click', () => addCriterion());
     mergeEnabledEl.addEventListener('change', () => {
       mergeRequestFields.classList.toggle('hidden', !mergeEnabledEl.checked);
     });
