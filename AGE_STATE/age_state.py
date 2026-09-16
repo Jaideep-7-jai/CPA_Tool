@@ -1052,6 +1052,7 @@ def process_orange(request_id, run_dir: Path):
     try:
         request_type    = ctx["request_type"]
         client_name     = ctx["client_name"]
+        criteria_label  = _safe_filename_part(ctx["criteria_type"].title())
         channel_tmp     = ctx["channel_tmp"]
         final_files_dir = ctx["final_files_dir"]
         path_date       = ctx["path_date"]
@@ -1147,9 +1148,10 @@ def process_orange(request_id, run_dir: Path):
         update_request_status(request_id, "Posting To FTP", channel_status, log)
 
         if request_type.lower() == "suppression":
-            output_file      = (
-                f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
-            )
+            # Use the common output name so ORANGE follows the same
+            # Client_Criteria_RequestType_Channel_Date convention as the
+            # GREEN, BLUE, and ARCAMAX channels.
+            output_file      = ctx["output_file"]
             suppression_path = final_files_dir / output_file
             deduped          = df_final[["email_address"]].drop_duplicates()
             deduped.to_csv(str(suppression_path), index=False, header=False)
@@ -1176,7 +1178,7 @@ def process_orange(request_id, run_dir: Path):
                 )
                 esp_file = (
                     esp_split_dir
-                    / f"{client_name}_{request_type}_{esp}_{path_date}.csv"
+                    / f"{client_name}_{criteria_label}_{request_type}_{esp}_{path_date}.csv"
                 )
                 esp_df.to_csv(str(esp_file), index=False, header=True)
                 zip_parts.append(esp_file)
@@ -1185,7 +1187,7 @@ def process_orange(request_id, run_dir: Path):
                     f"  ESP split: {esp_file.name}  |  rows: {len(esp_df):,}"
                 )
 
-            zip_name = f"{client_name}_{request_type}_ORANGE_{path_date}.zip"
+            zip_name = Path(ctx["output_file"]).with_suffix(".zip").name
             zip_path = final_files_dir / zip_name
             run_command(
                 ["zip", "-j", str(zip_path)] + [str(p) for p in zip_parts]
