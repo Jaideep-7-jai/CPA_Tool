@@ -71,13 +71,15 @@
                   <span class="channel-status-name">EMAIL FILE</span>
                   <span class="badge-status artifact-pill {{ email_status }} has-popup" tabindex="0"
                     data-channel="EMAIL_FILE" data-status="{{ email_status|replace('inprogress', 'In Progress')|title }}"
-                    data-ftp="{{ r.DOORDASH_EMAIL_FTP or '' }}" data-filecount="{{ r.DOORDASH_EMAIL_FILECOUNT or '' }}">EMAIL_FILE</span>
+                    data-ftp="{{ r.DOORDASH_EMAIL_FTP or '' }}" data-filecount="{{ r.DOORDASH_EMAIL_FILECOUNT or '' }}"
+                    data-filepath="{{ r.DOORDASH_EMAIL_FILEPATH or '' }}">EMAIL_FILE{% if r.DOORDASH_EMAIL_MERGE_STATUS == 'MERGED' %} · Merged{% elif r.DOORDASH_EMAIL_MERGE_STATUS == 'CURRENT_ONLY' %} · Current{% endif %}</span>
                 </div>
                 <div class="channel-status-item">
                   <span class="channel-status-name">MD5 HASH FILE</span>
                   <span class="badge-status artifact-pill {{ md5_status }} has-popup" tabindex="0"
                     data-channel="MD5HASH_FILE" data-status="{{ md5_status|replace('inprogress', 'In Progress')|title }}"
-                    data-ftp="{{ r.DOORDASH_MD5HASH_FTP or '' }}" data-filecount="{{ r.DOORDASH_MD5HASH_FILECOUNT or '' }}">MD5HASH_FILE</span>
+                    data-ftp="{{ r.DOORDASH_MD5HASH_FTP or '' }}" data-filecount="{{ r.DOORDASH_MD5HASH_FILECOUNT or '' }}"
+                    data-filepath="{{ r.DOORDASH_MD5HASH_FILEPATH or '' }}">MD5HASH_FILE{% if r.DOORDASH_MD5HASH_MERGE_STATUS == 'MERGED' %} · Merged{% elif r.DOORDASH_MD5HASH_MERGE_STATUS == 'CURRENT_ONLY' %} · Current{% endif %}</span>
                 </div>
                 {% if is_privileged %}
                 {% for channel in ['GREEN', 'BLUE', 'ARCAMAX', 'ORANGE', 'APPTNESS'] %}
@@ -88,7 +90,7 @@
                     <span class="badge-status {{ status_class }} has-popup" tabindex="0"
                       data-channel="{{ channel }}" data-status="{{ status }}" data-ftp="{{ r[channel ~ '_FTP'] or '' }}"
                       data-filecount="{{ r[channel ~ '_FILECOUNT'] or '' }}" data-filepath="{{ r[channel ~ '_FILEPATH'] or '' }}"
-                      data-filesize="{{ r[channel ~ '_FILESIZE'] or '' }}">{{ status }}</span>
+                      data-filesize="{{ r[channel ~ '_FILESIZE'] or '' }}">{{ status }}{% if r[channel ~ '_MERGE_STATUS'] == 'MERGED' %} · Merged{% elif r[channel ~ '_MERGE_STATUS'] == 'CURRENT_ONLY' %} · Current{% endif %}</span>
                   </div>
                 {% endfor %}
                 {% else %}
@@ -112,7 +114,7 @@
                     <span class="badge-status {{ status_class }} has-popup" tabindex="0"
                       data-channel="{{ channel }}" data-status="{{ status }}" data-ftp="{{ r[channel ~ '_FTP'] or '' }}"
                       data-filecount="{{ r[channel ~ '_FILECOUNT'] or '' }}" data-filepath="{{ r[channel ~ '_FILEPATH'] or '' }}"
-                      data-filesize="{{ r[channel ~ '_FILESIZE'] or '' }}">{{ status }}</span>
+                      data-filesize="{{ r[channel ~ '_FILESIZE'] or '' }}">{{ status }}{% if r[channel ~ '_MERGE_STATUS'] == 'MERGED' %} · Merged{% elif r[channel ~ '_MERGE_STATUS'] == 'CURRENT_ONLY' %} · Current{% endif %}</span>
                   </div>
                 {% endif %}
               {% endfor %}
