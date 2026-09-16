@@ -213,18 +213,16 @@ def fetch_request_details(request_id):
             cur.execute(
                 """
                 SELECT
-                    r.id,
-                    r.client_name,
-                    r.request_type,
-                    r.request_name,
-                    r.criteria_type,
-                    r.criteria_value,
-                    r.comp_type,
-                    r.output_dir,
-                    u.username AS created_by_username
-                FROM requests r
-                JOIN users u ON u.id = r.created_by
-                WHERE r.id=%s
+                    id,
+                    client_name,
+                    request_type,
+                    request_name,
+                    criteria_type,
+                    criteria_value,
+                    comp_type,
+                    output_dir
+                FROM requests
+                WHERE id=%s
                 """,
                 (request_id,),
             )
@@ -482,8 +480,12 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
         )
         if criteria_type == "age":
             cond_col  = "b.AGE"
-            op        = ">=" if comp_type == "greater" else "<"
-            condition = f"b.AGE {op} {criteria_value}"
+            if comp_type == "between":
+                age_from, age_to = sorted(int(value.strip()) for value in str(criteria_value).split(",", 1))
+                condition = f"b.AGE BETWEEN {age_from} AND {age_to}"
+            else:
+                op        = ">=" if comp_type == "greater" else "<"
+                condition = f"b.AGE {op} {criteria_value}"
         else:
             cond_col = "b.STATE"
             if isinstance(criteria_value, str):
@@ -502,13 +504,19 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
 
     elif channel_name == "ARCAMAX":
         if criteria_type == "age":
-            date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
             cond_col    = "birthday"
-            op          = "<=" if comp_type == "greater" else ">="
-            condition   = (
-                f"birthday IS NOT NULL AND TRY_TO_DATE(birthday) "
-                f"{op} '{date_cutoff}'"
-            )
+            if comp_type == "between":
+                age_from, age_to = sorted(int(value.strip()) for value in str(criteria_value).split(",", 1))
+                older_date = get_dob_cutoff(age_to, "greater")
+                younger_date = get_dob_cutoff(age_from, "greater")
+                condition = f"birthday IS NOT NULL AND TRY_TO_DATE(birthday) BETWEEN '{older_date}' AND '{younger_date}'"
+            else:
+                date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
+                op          = "<=" if comp_type == "greater" else ">="
+                condition   = (
+                    f"birthday IS NOT NULL AND TRY_TO_DATE(birthday) "
+                    f"{op} '{date_cutoff}'"
+                )
         else:
             cond_col = "STATE"
             if isinstance(criteria_value, str):
@@ -526,10 +534,16 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
 
     else:  # ORANGE
         if criteria_type == "age":
-            date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
             cond_col    = "a.dob"
-            op          = "<=" if comp_type == "greater" else ">="
-            condition   = f"dob {op} '{date_cutoff}'"
+            if comp_type == "between":
+                age_from, age_to = sorted(int(value.strip()) for value in str(criteria_value).split(",", 1))
+                older_date = get_dob_cutoff(age_to, "greater")
+                younger_date = get_dob_cutoff(age_from, "greater")
+                condition = f"TRY_TO_DATE(dob) BETWEEN '{older_date}' AND '{younger_date}'"
+            else:
+                date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
+                op          = "<=" if comp_type == "greater" else ">="
+                condition   = f"dob {op} '{date_cutoff}'"
         else:
             cond_col = "a.STATE"
             if isinstance(criteria_value, str):
