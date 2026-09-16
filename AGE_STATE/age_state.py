@@ -220,7 +220,9 @@ def fetch_request_details(request_id):
                     criteria_type,
                     criteria_value,
                     comp_type,
-                    output_dir
+                    output_dir,
+                    responder_match,
+                    responder_days
                 FROM requests
                 WHERE id=%s
                 """,
@@ -468,9 +470,33 @@ def _download_and_combine(s3_path, download_dir, work_dir,
 # Snowflake helpers  (all accept a 'log' parameter — channel logger)
 # ---------------------------------------------------------------------------
 
+def _responder_join(channel_name, responder_match, responder_days):
+    """Return the optional, deduplicated responder join for one channel."""
+    if not responder_match or channel_name not in ("GREEN", "BLUE", "ORANGE"):
+        return ""
+    days = int(responder_days or 0)
+    if days < 1:
+        raise ValueError("Responder Match requires responder_days to be at least 1.")
+    if channel_name in ("GREEN", "BLUE"):
+        return (
+            "JOIN (SELECT DISTINCT LOWER(TRIM(emailid)) AS email "
+            "FROM GREEN.GREEN_LPT.RAW_OPENS_FOLLOWUP "
+            "WHERE opendate >= DATEADD(day, -{0}, CURRENT_DATE())) responders "
+            "ON LOWER(TRIM(a.email)) = responders.email ".format(days)
+        )
+    return (
+        "JOIN (SELECT DISTINCT LOWER(TRIM(email)) AS email "
+        "FROM GREEN.DT_DATA.APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND "
+        "WHERE OPEN_DATE >= DATEADD(day, -{0}, CURRENT_DATE())) responders "
+        "ON LOWER(TRIM(a.email_address)) = responders.email ".format(days)
+    )
+
+
 def _insert_into_perm_table(perm_table, channel_name, criteria_type,
-                              criteria_value, comp_type, log):
+                              criteria_value, comp_type, responder_match,
+                              responder_days, log):
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
+    responder_join = _responder_join(channel_name, responder_match, responder_days)
 
     if channel_name in ("GREEN", "BLUE"):
         profile_table = (
@@ -481,7 +507,7 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
         if criteria_type == "age":
             cond_col  = "b.AGE"
             if comp_type == "between":
-                age_from, age_to = sorted(int(value.strip()) for value in str(criteria_value).split(",", 1))
+                age_from, age_to = sorted(int(part.strip()) for part in str(criteria_value).split(",", 1))
                 condition = f"b.AGE BETWEEN {age_from} AND {age_to}"
             else:
                 op        = ">=" if comp_type == "greater" else "<"
@@ -499,6 +525,7 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
             f"SELECT a.email, {cond_col} "
             f"FROM {profile_table} a "
             f"JOIN APT_CUSTOM_GREEN_REA_DATA_DND b ON a.md5hash = b.EMAIL_MD5 "
+            f"{responder_join}"
             f"WHERE {condition};"
         )
 
@@ -506,7 +533,7 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
         if criteria_type == "age":
             cond_col    = "birthday"
             if comp_type == "between":
-                age_from, age_to = sorted(int(value.strip()) for value in str(criteria_value).split(",", 1))
+                age_from, age_to = sorted(int(part.strip()) for part in str(criteria_value).split(",", 1))
                 older_date = get_dob_cutoff(age_to, "greater")
                 younger_date = get_dob_cutoff(age_from, "greater")
                 condition = f"birthday IS NOT NULL AND TRY_TO_DATE(birthday) BETWEEN '{older_date}' AND '{younger_date}'"
@@ -536,7 +563,7 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
         if criteria_type == "age":
             cond_col    = "a.dob"
             if comp_type == "between":
-                age_from, age_to = sorted(int(value.strip()) for value in str(criteria_value).split(",", 1))
+                age_from, age_to = sorted(int(part.strip()) for part in str(criteria_value).split(",", 1))
                 older_date = get_dob_cutoff(age_to, "greater")
                 younger_date = get_dob_cutoff(age_from, "greater")
                 condition = f"TRY_TO_DATE(dob) BETWEEN '{older_date}' AND '{younger_date}'"
@@ -568,8 +595,8 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
             f"  ON a.FEED_ID = b.FEEDID "
             f"JOIN APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND c "
             f"  ON a.email_address = c.email_address "
-            f"JOIN APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND d "
-            f"  ON a.email_address = d.email;"
+            f"{responder_join}"
+            f"WHERE 1=1;"
         )
 
     log.info(f"  Target table : {perm_table}")
@@ -736,7 +763,9 @@ def process_green_blue(request_id, channel_name, run_dir: Path):
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
         inserted_count  = _insert_into_perm_table(
             perm_table, channel_name,
-            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
+            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"],
+            ctx["request_data"].get("responder_match"),
+            ctx["request_data"].get("responder_days"), log
         )
 
         if inserted_count == 0:
@@ -872,7 +901,9 @@ def process_arcamax(request_id, run_dir: Path):
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
         inserted_count = _insert_into_perm_table(
             perm_table, channel_name,
-            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
+            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"],
+            ctx["request_data"].get("responder_match"),
+            ctx["request_data"].get("responder_days"), log
         )
 
         if inserted_count == 0:
@@ -1013,7 +1044,9 @@ def process_orange(request_id, run_dir: Path):
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
         inserted_count = _insert_into_perm_table(
             perm_table, channel_name,
-            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
+            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"],
+            ctx["request_data"].get("responder_match"),
+            ctx["request_data"].get("responder_days"), log
         )
 
         if inserted_count == 0:
