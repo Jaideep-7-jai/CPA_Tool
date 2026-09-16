@@ -50,6 +50,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const addCriteriaBtn = document.getElementById('addCriteriaBtn');
   const mergeEnabledEl = document.getElementById('merge_enabled');
   const mergeRequestFields = document.getElementById('mergeRequestFields');
+  const mergeSourceNameEl = document.getElementById('merge_source_request_name');
+  const mergeSourceStatusEl = document.getElementById('mergeSourceStatus');
+  const mergeSourceHintEl = document.getElementById('mergeSourceHint');
   const responderMatchEl = document.getElementById('responder_match');
   const responderDaysFields = document.getElementById('responderDaysFields');
   const responderDaysEl = document.getElementById('responder_days');
@@ -59,6 +62,70 @@ document.addEventListener('DOMContentLoaded', () => {
   function syncResponderDaysValue() {
     if (!responderDaysEl || !responderDaysValueEl) return;
     responderDaysValueEl.textContent = `${responderDaysEl.value} day${responderDaysEl.value === '1' ? '' : 's'}`;
+  }
+
+  // ── Merge source eligibility check ───────────────────────────────────────
+  // The submit API performs this same check authoritatively. This check makes
+  // the result visible beside the Previous Request Name field.
+  let mergeSourceCheckTimer = null;
+  let mergeSourceIsValid = false;
+  const mergeSourceDefaultHint =
+    'Matching channel files are merged; the previous request remains unchanged.';
+
+  function resetMergeSourceStatus() {
+    mergeSourceIsValid = false;
+    mergeSourceStatusEl.textContent = '';
+    mergeSourceStatusEl.className = 'name-status';
+    mergeSourceNameEl.classList.remove('error-input');
+    mergeSourceHintEl.textContent = mergeSourceDefaultHint;
+  }
+
+  function checkMergeSource() {
+    const sourceName = mergeSourceNameEl.value.trim();
+    const currentType = requestTypeEl.value;
+    if (!mergeEnabledEl.checked || !sourceName) {
+      resetMergeSourceStatus();
+      return;
+    }
+
+    mergeSourceIsValid = false;
+    mergeSourceStatusEl.textContent = 'Checking…';
+    mergeSourceStatusEl.className = 'name-status checking';
+    mergeSourceNameEl.classList.remove('error-input');
+
+    const params = new URLSearchParams({
+      name: sourceName,
+      request_type: currentType,
+    });
+    fetch(`/api/check-merge-source?${params.toString()}`)
+      .then(response => response.json())
+      .then(data => {
+        mergeSourceHintEl.textContent = data.message || mergeSourceDefaultHint;
+        if (data.available) {
+          mergeSourceStatusEl.textContent = '✅ Eligible';
+          mergeSourceStatusEl.className = 'name-status available';
+          mergeSourceNameEl.classList.remove('error-input');
+          mergeSourceIsValid = true;
+        } else {
+          mergeSourceStatusEl.textContent = '✖ Not eligible';
+          mergeSourceStatusEl.className = 'name-status taken';
+          mergeSourceNameEl.classList.add('error-input');
+          mergeSourceIsValid = false;
+        }
+      })
+      .catch(() => {
+        mergeSourceStatusEl.textContent = '⚠ Check failed';
+        mergeSourceStatusEl.className = 'name-status error';
+        mergeSourceNameEl.classList.add('error-input');
+        mergeSourceHintEl.textContent = 'Unable to validate the previous request. Try again.';
+        mergeSourceIsValid = false;
+      });
+  }
+
+  function scheduleMergeSourceCheck() {
+    clearTimeout(mergeSourceCheckTimer);
+    mergeSourceIsValid = false;
+    mergeSourceCheckTimer = setTimeout(checkMergeSource, 400);
   }
 
   function criterionOptions(selected) {
@@ -178,8 +245,14 @@ document.addEventListener('DOMContentLoaded', () => {
     mergeEnabledEl.addEventListener('change', () => {
       const enabled = mergeEnabledEl.checked;
       mergeRequestFields.classList.toggle('hidden', !enabled);
-      if (!enabled) document.getElementById('merge_source_request_name').value = '';
+      if (!enabled) {
+        mergeSourceNameEl.value = '';
+        resetMergeSourceStatus();
+      } else {
+        scheduleMergeSourceCheck();
+      }
     });
+    mergeSourceNameEl.addEventListener('input', scheduleMergeSourceCheck);
     responderMatchEl.addEventListener('change', () => {
       const enabled = responderMatchEl.checked;
       responderDaysFields.classList.toggle('hidden', !enabled);
@@ -291,6 +364,7 @@ document.addEventListener('DOMContentLoaded', () => {
     scheduleClientNameCheck();
     updateChannelChoices();
     updateCriteriaFields();
+    if (mergeEnabledEl.checked) scheduleMergeSourceCheck();
   }
 
   // ── Show/hide criteria value + file upload ──────────────────────────────────
@@ -483,6 +557,12 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
+      if (mergeEnabledEl.checked && !mergeSourceIsValid) {
+        formMessage.textContent = '⚠ Enter an eligible completed previous request before merging.';
+        formMessage.className   = 'message error';
+        return;
+      }
+
       const selectedChannels = getSelectedChannels();
       if (selectedChannels.length === 0) {
         formMessage.textContent = '⚠ Please select at least one channel.';
@@ -520,6 +600,7 @@ document.addEventListener('DOMContentLoaded', () => {
         form.reset();
         resetCriteriaBuilder();
         mergeRequestFields.classList.add('hidden');
+        resetMergeSourceStatus();
         responderDaysFields.classList.add('hidden');
         responderDaysEl.value = '30';
         syncResponderDaysValue();
