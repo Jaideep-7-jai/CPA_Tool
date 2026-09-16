@@ -50,6 +50,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const addCriteriaBtn = document.getElementById('addCriteriaBtn');
   const mergeEnabledEl = document.getElementById('merge_enabled');
   const mergeRequestFields = document.getElementById('mergeRequestFields');
+  const responderMatchEl = document.getElementById('responder_match');
+  const responderDaysFields = document.getElementById('responderDaysFields');
+  const responderDaysEl = document.getElementById('responder_days');
   const criteriaRows = [];
 
   function criterionOptions(selected) {
@@ -167,7 +170,15 @@ document.addEventListener('DOMContentLoaded', () => {
     addCriterion('age');
     addCriteriaBtn.addEventListener('click', () => addCriterion());
     mergeEnabledEl.addEventListener('change', () => {
-      mergeRequestFields.classList.toggle('hidden', !mergeEnabledEl.checked);
+      const enabled = mergeEnabledEl.checked;
+      mergeRequestFields.classList.toggle('hidden', !enabled);
+      if (!enabled) document.getElementById('merge_source_request_name').value = '';
+    });
+    responderMatchEl.addEventListener('change', () => {
+      const enabled = responderMatchEl.checked;
+      responderDaysFields.classList.toggle('hidden', !enabled);
+      responderDaysEl.required = enabled;
+      if (!enabled) responderDaysEl.value = '';
     });
   }
 
@@ -253,29 +264,18 @@ document.addEventListener('DOMContentLoaded', () => {
     if (isDoordash) {
       clientNameEl.value  = 'Doordash';
       clientNameEl.setAttribute('readonly', true);
-      criteriaTypeEl.value = 'zips';
-      criteriaTypeEl.setAttribute('disabled', true);
-      compTypeEl.value    = 'include';
-      compTypeEl.setAttribute('disabled', true);
       // Doordash always runs ALL channels. Keep the selection and all labels
       // visible, while locking the group so the end user cannot change it.
       setChannelLock(true, 'ALL');
     } else {
       clientNameEl.removeAttribute('readonly');
       if (clientNameEl.value === 'Doordash') clientNameEl.value = '';
-      criteriaTypeEl.removeAttribute('disabled');
-      compTypeEl.removeAttribute('disabled');
       setChannelLock(false);
     }
     if (criteriaBuilderGroup) {
       criteriaBuilderGroup.classList.toggle('hidden', isDoordash);
-      const mergeGroup = mergeEnabledEl ? mergeEnabledEl.closest('.form-group') : null;
-      if (mergeGroup) mergeGroup.classList.toggle('hidden', isDoordash);
       if (isDoordash) {
         criteriaJsonEl.value = '';
-        mergeEnabledEl.checked = false;
-        mergeRequestFields.classList.add('hidden');
-        document.getElementById('merge_source_request_name').value = '';
       } else {
         syncCriteriaJson();
       }
@@ -482,10 +482,6 @@ document.addEventListener('DOMContentLoaded', () => {
       formMessage.textContent = 'Submitting…';
       formMessage.className   = 'message loading';
 
-      // Re-enable disabled selects so their values are included in FormData
-      const disabledSelects = form.querySelectorAll('select[disabled]');
-      disabledSelects.forEach(s => s.removeAttribute('disabled'));
-
       // Re-enable channel checkboxes to allow FormData to collect them
       [chAll, ...individualChannels].forEach(cb => cb.removeAttribute('disabled'));
 
@@ -498,11 +494,7 @@ document.addEventListener('DOMContentLoaded', () => {
       selectedChannels.forEach(ch => body.append('channel', ch));
 
       // Re-disable after collecting
-      if (requestTypeEl.value === 'Doordash') {
-        criteriaTypeEl.setAttribute('disabled', true);
-        compTypeEl.setAttribute('disabled', true);
-        setChannelLock(true, 'ALL');
-      }
+      if (requestTypeEl.value === 'Doordash') setChannelLock(true, 'ALL');
 
       try {
         const res  = await fetch('/api/submit', { method: 'POST', body });
@@ -517,6 +509,7 @@ document.addEventListener('DOMContentLoaded', () => {
         form.reset();
         resetCriteriaBuilder();
         mergeRequestFields.classList.add('hidden');
+        responderDaysFields.classList.add('hidden');
         // Reset channel visual state
         document.querySelectorAll('.channel-option').forEach(lbl => lbl.classList.remove('checked'));
         [chAll, ...individualChannels].forEach(cb => { cb.checked = false; cb.disabled = false; });
