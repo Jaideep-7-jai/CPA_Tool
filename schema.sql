@@ -18,12 +18,14 @@ CREATE TABLE IF NOT EXISTS requests (
     request_type    ENUM('Suppression','Mailing','Doordash') NOT NULL DEFAULT 'Suppression',
     client_name     VARCHAR(255) NOT NULL DEFAULT '',
     created_by      INT NOT NULL,
-    criteria_type   ENUM('age','state','zips') NOT NULL,
+    criteria_type   VARCHAR(50) NOT NULL,
     comp_type       ENUM('greater','less','include','exclude') NOT NULL DEFAULT 'include',
     -- VARCHAR instead of ENUM so multi-channel strings like 'GREEN,ORANGE' are stored correctly
     channel         VARCHAR(100) NOT NULL DEFAULT 'ALL',
     criteria_value  VARCHAR(500) NULL COMMENT 'age value or state list; NULL for zips/doordash',
     zip_file_path   VARCHAR(500) NULL,
+    criteria_json   MEDIUMTEXT NULL,
+    merge_source_request_id BIGINT NULL,
     output_dir      VARCHAR(255) NOT NULL,
     overall_status  ENUM('inprogress','completed','failed') NOT NULL DEFAULT 'inprogress',
     GREEN_STATUS    VARCHAR(50)  NULL,
@@ -60,6 +62,20 @@ CREATE TABLE IF NOT EXISTS requests (
 -- ─── Migration helpers (run on existing installs) ───────────────────────────
 -- Fix channel column: ENUM -> VARCHAR so multi-channel values like 'GREEN,ORANGE' work
 ALTER TABLE requests MODIFY COLUMN channel VARCHAR(100) NOT NULL DEFAULT 'ALL';
+ALTER TABLE requests MODIFY COLUMN criteria_type VARCHAR(50) NOT NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS criteria_json MEDIUMTEXT NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS merge_source_request_id BIGINT NULL;
+
+CREATE TABLE IF NOT EXISTS request_criteria (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    request_id BIGINT NOT NULL,
+    criteria_type VARCHAR(50) NOT NULL,
+    comparison_type VARCHAR(50) NOT NULL,
+    criteria_value MEDIUMTEXT NULL,
+    zip_file_path VARCHAR(500) NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (request_id) REFERENCES requests(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Add per-channel status / FTP / filecount / filename columns if missing
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS APPTNESS_STATUS  VARCHAR(50)  NULL;
