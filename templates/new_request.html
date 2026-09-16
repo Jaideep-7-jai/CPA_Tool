@@ -4,6 +4,11 @@
 {% block breadcrumb %}<span class="breadcrumb">Requests &rsaquo; New</span>{% endblock %}
 
 {% block content %}
+<style>
+.responder-range-header { display:flex; justify-content:space-between; align-items:center; margin:10px 0 6px; font-size:.84rem; color:var(--muted); }
+.responder-range-value { color:var(--primary); font-weight:700; }
+#responder_days { width:100%; accent-color:var(--primary); }
+</style>
 <div class="request-page-container">
 
   <!-- ── Form ─────────────────────────────────── -->
@@ -97,10 +102,14 @@
           <span>Responder Match</span>
         </label>
         <div id="responderDaysFields" class="hidden">
-          <input type="number" name="responder_days" id="responder_days"
-                 min="1" step="1" inputmode="numeric"
-                 placeholder="Enter responder lookback days">
-          <small>Include responders who opened within the specified number of days.</small>
+          <div class="responder-range-header">
+            <span>Responder lookback period</span>
+            <output id="responder_days_value" class="responder-range-value" for="responder_days">30 days</output>
+          </div>
+          <input type="range" name="responder_days" id="responder_days"
+                 min="1" max="120" step="1" value="30"
+                 aria-describedby="responder_days_help">
+          <small id="responder_days_help">Include responders who opened within the selected 1–120 day period.</small>
         </div>
       </div>
 
@@ -184,7 +193,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='request-form.js') }}?v=20260916-criteria-limit" defer></script>
+<script src="{{ url_for('static', filename='request-form.js') }}?v=20260916-responder-slider" defer></script>
 <script>
 // Sync checkbox → visual "checked" class
 document.querySelectorAll('.channel-option').forEach(lbl => {
