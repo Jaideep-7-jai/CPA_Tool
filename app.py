@@ -1057,6 +1057,11 @@ def submit_request():
         return jsonify({'ok': False, 'error': f'Request name "{request_name}" is already taken.'}), 400
     if request_type not in {'Suppression', 'Mailing', 'Doordash'}:
         return jsonify({'ok': False, 'error': 'Invalid request type.'}), 400
+    if request_type == 'Doordash':
+        client_name   = 'Doordash'
+        criteria_type = 'zips'
+        comp_type     = 'include'
+        channel_list  = ['ALL']
     if criteria_items:
         allowed_criteria = {'age', 'state', 'zips'}
         criteria_types = [item.get('type') for item in criteria_items]
@@ -1076,12 +1081,6 @@ def submit_request():
             comp_type = 'include'
     if criteria_type not in {'age', 'state', 'zips', 'multi'}:
         return jsonify({'ok': False, 'error': 'Criteria type must be age, state, or zips.'}), 400
-
-    if request_type == 'Doordash':
-        client_name   = 'Doordash'
-        criteria_type = 'zips'
-        comp_type     = 'include'
-        channel_list  = ['ALL']
 
     if not client_name:
         return jsonify({'ok': False, 'error': 'Client Name is required.'}), 400
