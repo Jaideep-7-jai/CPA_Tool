@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import SNOWSQL_PASSPHRASE, AWS_KEY_ID, AWS_SECRET_KEY, S3_BASE
 from utils import run_command, send_success_email, send_error_email
+from MERGE_OUTPUT.merge_output import merge_doordash_file
 from ZIPS.zips import (
     _build_common_context,
     _create_zip_staging_table,
@@ -178,16 +179,34 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
 
     email_dest = final_files_dir / email_name
     shutil.move(str(run_dir / "EMAIL_FINAL_TMP" / email_name), str(email_dest))
+    email_merge_mode = "CURRENT_ONLY"
+    if request_data.get("merge_source_request_id"):
+        email_merge = merge_doordash_file(
+            request_id, request_data["merge_source_request_id"], "EMAIL",
+            email_dest, email_s3, run_dir, log,
+        )
+        email_count = email_merge["count"]
+        email_s3 = email_merge["s3_path"]
+        email_merge_mode = email_merge["merge_mode"]
     email_ftp_path = _post_to_ftp(final_files_dir, path_date, email_name, log, request_type=request_type)
     shutil.rmtree(str(run_dir / "EMAIL_FINAL_TMP"), ignore_errors=True)
-    outputs = [{"channel": "DOORDASH_EMAIL", "file": email_name, "final_file_path": str(email_dest), "status": "SUCCESS", "count": email_count, "s3_path": email_s3, "ftp_path": email_ftp_path}]
+    outputs = [{"channel": "DOORDASH_EMAIL", "file": email_name, "final_file_path": str(email_dest), "status": "SUCCESS", "count": email_count, "s3_path": email_s3, "ftp_path": email_ftp_path, "merge_mode": email_merge_mode}]
 
     if arcamax_table:
         md5_dest = final_files_dir / md5_name
         shutil.move(str(run_dir / "MD5_FINAL_TMP" / md5_name), str(md5_dest))
+        md5_merge_mode = "CURRENT_ONLY"
+        if request_data.get("merge_source_request_id"):
+            md5_merge = merge_doordash_file(
+                request_id, request_data["merge_source_request_id"], "MD5HASH",
+                md5_dest, md5_s3, run_dir, log,
+            )
+            md5_count = md5_merge["count"]
+            md5_s3 = md5_merge["s3_path"]
+            md5_merge_mode = md5_merge["merge_mode"]
         md5_ftp_path = _post_to_ftp(final_files_dir, path_date, md5_name, log, request_type=request_type)
         shutil.rmtree(str(run_dir / "MD5_FINAL_TMP"), ignore_errors=True)
-        outputs.append({"channel": "DOORDASH_ARCAMAX_MD5", "file": md5_name, "final_file_path": str(md5_dest), "status": "SUCCESS", "count": md5_count, "s3_path": md5_s3, "ftp_path": md5_ftp_path})
+        outputs.append({"channel": "DOORDASH_ARCAMAX_MD5", "file": md5_name, "final_file_path": str(md5_dest), "status": "SUCCESS", "count": md5_count, "s3_path": md5_s3, "ftp_path": md5_ftp_path, "merge_mode": md5_merge_mode})
     return outputs
 
 
@@ -248,12 +267,16 @@ def process_doordash_zip_request(request_id: int, zip_file: str, channel, output
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE requests SET DOORDASH_EMAIL_FTP=%s, DOORDASH_EMAIL_FILECOUNT=%s, DOORDASH_MD5HASH_FTP=%s, DOORDASH_MD5HASH_FILECOUNT=%s WHERE id=%s",
+                        "UPDATE requests SET DOORDASH_EMAIL_FTP=%s, DOORDASH_EMAIL_FILECOUNT=%s, DOORDASH_EMAIL_FILEPATH=%s, DOORDASH_EMAIL_MERGE_STATUS=%s, DOORDASH_MD5HASH_FTP=%s, DOORDASH_MD5HASH_FILECOUNT=%s, DOORDASH_MD5HASH_FILEPATH=%s, DOORDASH_MD5HASH_MERGE_STATUS=%s WHERE id=%s",
                         (
                             email_output.get("ftp_path") if email_output else None,
                             email_output.get("count") if email_output else None,
+                            email_output.get("s3_path") if email_output else None,
+                            email_output.get("merge_mode") if email_output else None,
                             md5_output.get("ftp_path") if md5_output else None,
                             md5_output.get("count") if md5_output else None,
+                            md5_output.get("s3_path") if md5_output else None,
+                            md5_output.get("merge_mode") if md5_output else None,
                             request_id,
                         ),
                     )
