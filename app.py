@@ -1050,8 +1050,8 @@ def submit_request():
     responder_days = None
 
     if responder_match:
-        if not responder_days_raw.isdigit() or int(responder_days_raw) < 1:
-            return jsonify({'ok': False, 'error': 'Responder Match requires a whole number of days (minimum 1).'}), 400
+        if not responder_days_raw.isdigit() or not 1 <= int(responder_days_raw) <= 120:
+            return jsonify({'ok': False, 'error': 'Responder Match requires a whole number of days between 1 and 120.'}), 400
         responder_days = int(responder_days_raw)
 
     if criteria_json_raw:
