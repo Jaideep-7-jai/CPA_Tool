@@ -43,6 +43,110 @@ document.addEventListener('DOMContentLoaded', () => {
   const fileUploadGroup    = document.getElementById('fileUploadGroup');
   const compTypeGroup      = document.getElementById('compTypeGroup');
 
+  // ── Multiple criteria builder (all selected criteria use OR logic) ────────
+  const criteriaBuilder = document.getElementById('criteriaBuilder');
+  const criteriaBuilderGroup = criteriaBuilder ? criteriaBuilder.closest('.form-group') : null;
+  const criteriaJsonEl = document.getElementById('criteria_json');
+  const addCriteriaBtn = document.getElementById('addCriteriaBtn');
+  const mergeEnabledEl = document.getElementById('merge_enabled');
+  const mergeRequestFields = document.getElementById('mergeRequestFields');
+  const criteriaRows = [];
+
+  function criterionOptions(selected) {
+    return ['age', 'state', 'zips'].map(type => {
+      const label = type === 'age' ? 'Age' : type === 'state' ? 'State' : 'ZIP';
+      return `<option value="${type}" ${type === selected ? 'selected' : ''}>${label}</option>`;
+    }).join('');
+  }
+
+  function syncCriteriaJson() {
+    const items = criteriaRows.map(row => {
+      const type = row.querySelector('.criteria-kind').value;
+      const comparison = row.querySelector('.criteria-comparison').value;
+      const item = { type, comparison };
+      if (type === 'age' && comparison === 'between') {
+        item.from = row.querySelector('.age-from').value.trim();
+        item.to = row.querySelector('.age-to').value.trim();
+      } else if (type === 'age') {
+        item.value = row.querySelector('.criteria-value').value.trim();
+      } else if (type === 'state') {
+        item.values = row.querySelector('.criteria-value').value
+          .split(',').map(value => value.trim()).filter(Boolean);
+      }
+      return item;
+    });
+    criteriaJsonEl.value = JSON.stringify(items);
+  }
+
+  function renderCriterionValue(row) {
+    const type = row.querySelector('.criteria-kind').value;
+    const comparison = row.querySelector('.criteria-comparison');
+    const valueWrap = row.querySelector('.criteria-row-value');
+    if (type === 'age') {
+      comparison.innerHTML = `
+        <option value="greater">Greater Than</option>
+        <option value="less">Lesser Than</option>
+        <option value="between">Between</option>`;
+      valueWrap.innerHTML = '<input class="criteria-value" type="number" min="0" placeholder="Age">';
+    } else if (type === 'state') {
+      comparison.innerHTML = '<option value="include">Include</option><option value="exclude">Exclude</option>';
+      valueWrap.innerHTML = '<input class="criteria-value" type="text" placeholder="CA, TX, NY">';
+    } else {
+      comparison.innerHTML = '<option value="include">Include</option><option value="exclude">Exclude</option>';
+      valueWrap.innerHTML = '<input type="file" name="zip_file" class="criteria-zip-file" accept=".csv,.txt"><span class="criteria-file-name">Upload ZIP file</span>';
+    }
+    syncCriteriaJson();
+  }
+
+  function addCriterion(type = 'age') {
+    const row = document.createElement('div');
+    row.className = 'criteria-row';
+    row.innerHTML = `
+      <select class="criteria-kind">${criterionOptions(type)}</select>
+      <select class="criteria-comparison"></select>
+      <div class="criteria-row-value"></div>
+      <button type="button" class="remove-criteria" title="Remove criterion"><i class="bi bi-trash"></i></button>`;
+    criteriaBuilder.appendChild(row);
+    criteriaRows.push(row);
+    renderCriterionValue(row);
+    row.querySelector('.criteria-kind').addEventListener('change', () => renderCriterionValue(row));
+    row.querySelector('.criteria-comparison').addEventListener('change', () => {
+      if (row.querySelector('.criteria-kind').value === 'age' && row.querySelector('.criteria-comparison').value === 'between') {
+        row.querySelector('.criteria-row-value').innerHTML = '<input class="age-from" type="number" min="0" placeholder="From age"><input class="age-to" type="number" min="0" placeholder="To age">';
+      } else {
+        renderCriterionValue(row);
+      }
+      syncCriteriaJson();
+    });
+    row.addEventListener('input', syncCriteriaJson);
+    row.addEventListener('change', event => {
+      if (event.target.classList.contains('criteria-zip-file')) {
+        const nameEl = row.querySelector('.criteria-file-name');
+        nameEl.textContent = event.target.files[0] ? event.target.files[0].name : 'Upload ZIP file';
+      }
+      syncCriteriaJson();
+    });
+    row.querySelector('.remove-criteria').addEventListener('click', () => {
+      if (criteriaRows.length === 1) return;
+      criteriaRows.splice(criteriaRows.indexOf(row), 1);
+      row.remove();
+      syncCriteriaJson();
+    });
+  }
+
+  function resetCriteriaBuilder() {
+    criteriaRows.splice(0).forEach(row => row.remove());
+    addCriterion('age');
+  }
+
+  if (criteriaBuilder) {
+    addCriterion('age');
+    addCriteriaBtn.addEventListener('click', () => addCriterion('state'));
+    mergeEnabledEl.addEventListener('change', () => {
+      mergeRequestFields.classList.toggle('hidden', !mergeEnabledEl.checked);
+    });
+  }
+
   // ── Channel single-click toggle ──────────────────────────────────────────────
   document.querySelectorAll('.channel-option').forEach(lbl => {
     lbl.addEventListener('click', (e) => {
@@ -138,6 +242,14 @@ document.addEventListener('DOMContentLoaded', () => {
       criteriaTypeEl.removeAttribute('disabled');
       compTypeEl.removeAttribute('disabled');
       setChannelLock(false);
+    }
+    if (criteriaBuilderGroup) {
+      criteriaBuilderGroup.classList.toggle('hidden', isDoordash);
+      if (isDoordash) {
+        criteriaJsonEl.value = '';
+      } else {
+        syncCriteriaJson();
+      }
     }
     scheduleClientNameCheck();
     updateChannelChoices();
@@ -374,6 +486,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         form.reset();
+        resetCriteriaBuilder();
+        mergeRequestFields.classList.add('hidden');
         // Reset channel visual state
         document.querySelectorAll('.channel-option').forEach(lbl => lbl.classList.remove('checked'));
         [chAll, ...individualChannels].forEach(cb => { cb.checked = false; cb.disabled = false; });
