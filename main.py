@@ -21,10 +21,10 @@ def parse_args():
                         choices=["Suppression", "Mailing", "Doordash"],
                         help="Type of request")
     parser.add_argument("--criteria-type", required=True,
-                        choices=["age", "state", "zips"],
+                        choices=["age", "state", "zips", "multi"],
                         help="Criteria type")
     parser.add_argument("--comp-type",     required=True,
-                        choices=["greater", "less", "include", "exclude"],
+                        choices=["greater", "less", "between", "include", "exclude"],
                         help="Comparison / inclusion type")
     # Accept one or more channel values: --channel GREEN --channel ORANGE
     # or a single value like --channel ALL
@@ -56,7 +56,18 @@ def main():
     if "ALL" in channels:
         channels = ["ALL"]
 
-    if criteria in ("age", "state"):
+    if criteria == "multi":
+        from MULTI_CRITERIA.multi_criteria import process_multi_criteria_request
+        if args.request_id is None:
+            print("[ERROR] --request-id is required for multi criteria", file=sys.stderr)
+            sys.exit(1)
+        process_multi_criteria_request(
+            request_id=args.request_id,
+            channel=channels,
+            output_dir=args.output_dir,
+        )
+
+    elif criteria in ("age", "state"):
         from AGE_STATE.age_state import process_age_state_request
         if args.request_id is None:
             print("[ERROR] --request-id is required for age/state criteria", file=sys.stderr)
