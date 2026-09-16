@@ -183,18 +183,18 @@ def fetch_request_details(request_id):
             cur.execute(
                 """
                 SELECT
-                    r.id,
-                    r.client_name,
-                    r.request_type,
-                    r.request_name,
-                    r.criteria_type,
-                    r.criteria_value,
-                    r.comp_type,
-                    r.output_dir,
-                    u.username AS created_by_username
-                FROM requests r
-                JOIN users u ON u.id = r.created_by
-                WHERE r.id=%s
+                    id,
+                    client_name,
+                    request_type,
+                    request_name,
+                    criteria_type,
+                    criteria_value,
+                    comp_type,
+                    output_dir,
+                    responder_match,
+                    responder_days
+                FROM requests
+                WHERE id=%s
                 """,
                 (request_id,),
             )
@@ -469,8 +469,31 @@ def _drop_zip_staging_table(zip_staging_table: str, log) -> None:
 
 # ── Per-channel perm table helpers ───────────────────────────────────────────
 
+def _responder_join(channel_name, responder_match, responder_days):
+    """Return the optional, deduplicated responder join for one channel."""
+    if not responder_match or channel_name not in ("GREEN", "BLUE", "ORANGE"):
+        return ""
+    days = int(responder_days or 0)
+    if days < 1:
+        raise ValueError("Responder Match requires responder_days to be at least 1.")
+    if channel_name in ("GREEN", "BLUE"):
+        return (
+            "JOIN (SELECT DISTINCT LOWER(TRIM(emailid)) AS email "
+            "FROM GREEN.GREEN_LPT.RAW_OPENS_FOLLOWUP "
+            "WHERE opendate >= DATEADD(day, -{0}, CURRENT_DATE())) responders "
+            "ON LOWER(TRIM(a.email)) = responders.email ".format(days)
+        )
+    return (
+        "JOIN (SELECT DISTINCT LOWER(TRIM(email)) AS email "
+        "FROM GREEN.DT_DATA.APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND "
+        "WHERE OPEN_DATE >= DATEADD(day, -{0}, CURRENT_DATE())) responders "
+        "ON LOWER(TRIM(a.email_address)) = responders.email ".format(days)
+    )
+
+
 def _insert_into_perm_table(
-    perm_table, channel_name, zip_staging_table, comp_type, log
+    perm_table, channel_name, zip_staging_table, comp_type, responder_match,
+    responder_days, log
 ):
     """
     CREATE OR REPLACE the per-channel permanent table by joining each
@@ -481,6 +504,7 @@ def _insert_into_perm_table(
       exclude  → zip_col NOT IN (SELECT zip_code FROM <zip_staging_table>)
     """
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
+    responder_join = _responder_join(channel_name, responder_match, responder_days)
 
     kw = "IN" if comp_type == "include" else "NOT IN"
 
@@ -498,6 +522,7 @@ def _insert_into_perm_table(
             f"SELECT a.email, b.ZIP "
             f"FROM {profile_table} a "
             f"JOIN APT_CUSTOM_GREEN_REA_DATA_DND b ON a.md5hash = b.EMAIL_MD5 "
+            f"{responder_join}"
             f"WHERE {condition};"
         )
 
@@ -532,8 +557,8 @@ def _insert_into_perm_table(
             f"  ON a.FEED_ID = b.FEEDID "
             f"JOIN APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND c "
             f"  ON a.email_address = c.email_address "
-            f"JOIN APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND d "
-            f"  ON a.email_address = d.email;"
+            f"{responder_join}"
+            f"WHERE 1=1;"
         )
 
     log.info(f"  Target table     : {perm_table}")
@@ -777,7 +802,9 @@ def process_green_blue_zip(request_id, channel_name, zip_staging_table, run_dir:
         _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting ZIP-matched data", channel_name)
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
         inserted_count = _insert_into_perm_table(
-            perm_table, channel_name, zip_staging_table, ctx["comp_type"], log
+            perm_table, channel_name, zip_staging_table, ctx["comp_type"],
+            ctx["request_data"].get("responder_match"),
+            ctx["request_data"].get("responder_days"), log
         )
 
         if inserted_count == 0:
@@ -899,7 +926,9 @@ def process_arcamax_zip(request_id, zip_staging_table, run_dir: Path):
         _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting ZIP-matched data", channel_name)
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
         inserted_count = _insert_into_perm_table(
-            perm_table, channel_name, zip_staging_table, ctx["comp_type"], log
+            perm_table, channel_name, zip_staging_table, ctx["comp_type"],
+            ctx["request_data"].get("responder_match"),
+            ctx["request_data"].get("responder_days"), log
         )
 
         if inserted_count == 0:
@@ -1019,7 +1048,9 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
         _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting ZIP-matched data", channel_name)
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
         inserted_count = _insert_into_perm_table(
-            perm_table, channel_name, zip_staging_table, ctx["comp_type"], log
+            perm_table, channel_name, zip_staging_table, ctx["comp_type"],
+            ctx["request_data"].get("responder_match"),
+            ctx["request_data"].get("responder_days"), log
         )
 
         if inserted_count == 0:
@@ -1301,19 +1332,16 @@ def process_zip_request(
     if errors:
         send_error_email(
             request_data,
-            "\n".join(f"{channel}: {error}" for channel, error in errors),
+            "\n".join(f"{c}: {e}" for c, e in errors),
             run_dir,
         )
     else:
         send_success_email(request_data, results, run_dir)
-    
+
     if errors:
         raise RuntimeError(
             "ZIP request failed for channel(s): "
-            + "; ".join(
-                f"{channel}: {error}"
-                for channel, error in errors
-            )
+            + "; ".join(f"{channel}: {error}" for channel, error in errors)
         )
 
 
