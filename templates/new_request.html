@@ -46,6 +46,8 @@
         <small id="clientNameHint">Must be unique for the current day.</small>
       </div>
 
+      <!-- Legacy single-criterion fields remain for backward-compatible scripts. -->
+      <div id="legacyCriteriaGroups" class="hidden">
       <!-- 4. Criteria Type -->
       <div class="form-group">
         <label for="criteria_type"><i class="bi bi-funnel-fill" style="color:var(--primary);margin-right:5px;"></i>Criteria Type</label>
@@ -75,6 +77,31 @@
           <option value="less">Less Than (Age)</option>
         </select>
       </div>
+      </div>
+
+      <!-- 4. Multiple Criteria -->
+      <div class="form-group criteria-builder-group">
+        <label><i class="bi bi-funnel-fill" style="color:var(--primary);margin-right:5px;"></i>Criteria</label>
+        <div id="criteriaBuilder" class="criteria-builder"></div>
+        <button type="button" id="addCriteriaBtn" class="add-criteria-button">
+          <i class="bi bi-plus-lg"></i> Add Criteria
+        </button>
+        <input type="hidden" name="criteria_json" id="criteria_json">
+        <small>Matching any selected criterion includes the record.</small>
+      </div>
+
+      <!-- 5. Merge existing output -->
+      <div class="form-group merge-request-group">
+        <label class="merge-toggle-label">
+          <input type="checkbox" id="merge_enabled">
+          <span>Merge Previous Output</span>
+        </label>
+        <div id="mergeRequestFields" class="hidden">
+          <input type="text" name="merge_source_request_name" id="merge_source_request_name"
+                 placeholder="Enter completed previous request name" autocomplete="off">
+          <small>Matching channel files are merged; the previous request remains unchanged.</small>
+        </div>
+      </div>
 
       <!-- 7. Channel -->
       <div class="form-group hidden" id="channelGroup">
@@ -103,18 +130,7 @@
         <small id="channelHint">Select one or more channels. "All Channels" overrides others.</small>
       </div>
 
-      <!-- 8. File Upload -->
-      <div class="form-group hidden" id="fileUploadGroup">
-        <label for="zip_file"><i class="bi bi-file-earmark-zip-fill" style="color:var(--primary);margin-right:5px;"></i>ZIP Codes File</label>
-        <div class="file-upload-area" id="fileDropArea">
-          <input type="file" name="zip_file" id="zip_file" accept=".csv,.txt" class="file-input">
-          <div class="file-upload-label">
-            <span class="file-icon">📁</span>
-            <span id="fileLabel">Click to select or drag &amp; drop a CSV/TXT file</span>
-          </div>
-        </div>
-        <small>CSV or TXT with ZIP codes (one per line or comma-separated).</small>
-      </div>
+      <div id="fileUploadGroup" class="hidden"></div>
 
       <button type="submit" class="submit-button" id="submitBtn" style="width:100%;justify-content:center;">
         <i class="bi bi-send-fill"></i> Submit Request
