@@ -53,7 +53,13 @@ document.addEventListener('DOMContentLoaded', () => {
   const responderMatchEl = document.getElementById('responder_match');
   const responderDaysFields = document.getElementById('responderDaysFields');
   const responderDaysEl = document.getElementById('responder_days');
+  const responderDaysValueEl = document.getElementById('responder_days_value');
   const criteriaRows = [];
+
+  function syncResponderDaysValue() {
+    if (!responderDaysEl || !responderDaysValueEl) return;
+    responderDaysValueEl.textContent = `${responderDaysEl.value} day${responderDaysEl.value === '1' ? '' : 's'}`;
+  }
 
   function criterionOptions(selected) {
     return ['age', 'state', 'zips'].map(type => {
@@ -177,9 +183,11 @@ document.addEventListener('DOMContentLoaded', () => {
     responderMatchEl.addEventListener('change', () => {
       const enabled = responderMatchEl.checked;
       responderDaysFields.classList.toggle('hidden', !enabled);
-      responderDaysEl.required = enabled;
-      if (!enabled) responderDaysEl.value = '';
+      if (enabled && !responderDaysEl.value) responderDaysEl.value = '30';
+      syncResponderDaysValue();
     });
+    responderDaysEl.addEventListener('input', syncResponderDaysValue);
+    syncResponderDaysValue();
   }
 
   // ── Channel single-click toggle ──────────────────────────────────────────────
@@ -510,6 +518,8 @@ document.addEventListener('DOMContentLoaded', () => {
         resetCriteriaBuilder();
         mergeRequestFields.classList.add('hidden');
         responderDaysFields.classList.add('hidden');
+        responderDaysEl.value = '30';
+        syncResponderDaysValue();
         // Reset channel visual state
         document.querySelectorAll('.channel-option').forEach(lbl => lbl.classList.remove('checked'));
         [chAll, ...individualChannels].forEach(cb => { cb.checked = false; cb.disabled = false; });
