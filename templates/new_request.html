@@ -153,7 +153,11 @@
         <small id="channelHint">Select one or more channels. "All Channels" overrides others.</small>
       </div>
 
-      <div id="fileUploadGroup" class="hidden"></div>
+      <div id="fileUploadGroup" class="form-group hidden">
+        <label for="zip_file"><i class="bi bi-file-earmark-arrow-up-fill" style="color:var(--primary);margin-right:5px;"></i>ZIP Codes File</label>
+        <input type="file" name="zip_file" id="zip_file" accept=".csv,.txt" disabled>
+        <small>Upload the ZIP-code CSV or TXT file for this DoorDash request.</small>
+      </div>
 
       <button type="submit" class="submit-button" id="submitBtn" style="width:100%;justify-content:center;">
         <i class="bi bi-send-fill"></i> Submit Request
@@ -193,7 +197,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='request-form.js') }}?v=20260916-responder-slider" defer></script>
+<script src="{{ url_for('static', filename='request-form.js') }}?v=20260916-doordash-zip" defer></script>
 <script>
 // Sync checkbox → visual "checked" class
 document.querySelectorAll('.channel-option').forEach(lbl => {
