@@ -991,6 +991,66 @@ def api_check_client_name():
     return jsonify({'available': not taken})
 
 
+@app.route('/api/check-merge-source')
+@login_required
+def api_check_merge_source():
+    """Validate a completed request selected as the merge source.
+
+    This is UI feedback only. ``submit_request`` repeats the same validation
+    before it creates a request, so a modified browser request cannot bypass it.
+    """
+    source_name = request.args.get('name', '').strip()
+    current_type = request.args.get('request_type', '').strip()
+
+    if not source_name:
+        return jsonify({
+            'available': False,
+            'message': 'Enter the completed previous request name.'
+        })
+    if current_type not in {'Suppression', 'Mailing', 'Doordash'}:
+        return jsonify({
+            'available': False,
+            'message': 'Select a valid request type first.'
+        })
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT request_type FROM requests "
+                "WHERE request_name=%s AND overall_status='completed'",
+                (source_name,),
+            )
+            previous = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not previous:
+        return jsonify({
+            'available': False,
+            'message': 'Previous Request Name must be a completed request.'
+        })
+
+    previous_type = previous[0]
+    if current_type == 'Doordash' and previous_type != 'Doordash':
+        return jsonify({
+            'available': False,
+            'message': 'DoorDash output can be merged only with a completed DoorDash request.'
+        })
+    if current_type != 'Doordash' and previous_type == 'Doordash':
+        return jsonify({
+            'available': False,
+            'message': 'Suppression/Mailing output cannot be merged with a DoorDash request.'
+        })
+
+    label = (
+        'Eligible completed DoorDash request.'
+        if current_type == 'Doordash'
+        else 'Eligible completed previous request.'
+    )
+    return jsonify({'available': True, 'message': label})
+
+
 
 @app.route('/api/requests')
 @login_required
