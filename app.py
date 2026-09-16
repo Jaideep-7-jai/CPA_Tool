@@ -115,6 +115,15 @@ def init_db():
                     merge_source_request_id BIGINT NULL,
                     responder_match TINYINT(1) NOT NULL DEFAULT 0,
                     responder_days  INT NULL,
+                    GREEN_MERGE_STATUS VARCHAR(20) NULL,
+                    BLUE_MERGE_STATUS VARCHAR(20) NULL,
+                    ARCAMAX_MERGE_STATUS VARCHAR(20) NULL,
+                    ORANGE_MERGE_STATUS VARCHAR(20) NULL,
+                    APPTNESS_MERGE_STATUS VARCHAR(20) NULL,
+                    DOORDASH_EMAIL_FILEPATH VARCHAR(500) NULL,
+                    DOORDASH_MD5HASH_FILEPATH VARCHAR(500) NULL,
+                    DOORDASH_EMAIL_MERGE_STATUS VARCHAR(20) NULL,
+                    DOORDASH_MD5HASH_MERGE_STATUS VARCHAR(20) NULL,
                     output_dir      VARCHAR(255) NOT NULL,
                     overall_status  ENUM('inprogress','completed','failed') NOT NULL DEFAULT 'inprogress',
                     GREEN_STATUS    VARCHAR(50)  NULL,
@@ -171,6 +180,8 @@ def init_db():
             _add_column_if_missing(cur, "requests", "merge_source_request_id", "BIGINT NULL")
             _add_column_if_missing(cur, "requests", "responder_match", "TINYINT(1) NOT NULL DEFAULT 0")
             _add_column_if_missing(cur, "requests", "responder_days", "INT NULL")
+            for channel_name in _ALL_CHANNELS:
+                _add_column_if_missing(cur, "requests", channel_name + "_MERGE_STATUS", "VARCHAR(20) NULL")
 
             _add_column_if_missing(cur, "requests", "APPTNESS_STATUS", "VARCHAR(50) NULL")
             _add_column_if_missing(cur, "requests", "APPTNESS_FTP", "VARCHAR(500) NULL")
@@ -203,6 +214,10 @@ def init_db():
             _add_column_if_missing(cur, "requests", "DOORDASH_MD5HASH_FTP", "VARCHAR(500) NULL")
             _add_column_if_missing(cur, "requests", "DOORDASH_EMAIL_FILECOUNT", "BIGINT NULL")
             _add_column_if_missing(cur, "requests", "DOORDASH_MD5HASH_FILECOUNT", "BIGINT NULL")
+            _add_column_if_missing(cur, "requests", "DOORDASH_EMAIL_FILEPATH", "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "DOORDASH_MD5HASH_FILEPATH", "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "DOORDASH_EMAIL_MERGE_STATUS", "VARCHAR(20) NULL")
+            _add_column_if_missing(cur, "requests", "DOORDASH_MD5HASH_MERGE_STATUS", "VARCHAR(20) NULL")
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS filedetails (
@@ -505,7 +520,11 @@ def fetch_all_requests(limit=200, username=None):
                     r.GREEN_FILEPATH,  r.BLUE_FILEPATH,  r.ARCAMAX_FILEPATH,  r.ORANGE_FILEPATH, r.APPTNESS_FILEPATH,
                     r.GREEN_FILESIZE,  r.BLUE_FILESIZE,  r.ARCAMAX_FILESIZE,  r.ORANGE_FILESIZE, r.APPTNESS_FILESIZE,
                     r.DOORDASH_EMAIL_FTP, r.DOORDASH_MD5HASH_FTP,
-                    r.DOORDASH_EMAIL_FILECOUNT, r.DOORDASH_MD5HASH_FILECOUNT
+                    r.DOORDASH_EMAIL_FILECOUNT, r.DOORDASH_MD5HASH_FILECOUNT,
+                    r.GREEN_MERGE_STATUS, r.BLUE_MERGE_STATUS, r.ARCAMAX_MERGE_STATUS,
+                    r.ORANGE_MERGE_STATUS, r.APPTNESS_MERGE_STATUS,
+                    r.DOORDASH_EMAIL_FILEPATH, r.DOORDASH_MD5HASH_FILEPATH,
+                    r.DOORDASH_EMAIL_MERGE_STATUS, r.DOORDASH_MD5HASH_MERGE_STATUS
                 FROM requests r
                 JOIN users u ON u.id = r.created_by
                 {scope}
@@ -553,6 +572,11 @@ def fetch_all_requests(limit=200, username=None):
                     "ORANGE_FILESIZE": row[39], "APPTNESS_FILESIZE": row[40],
                     "DOORDASH_EMAIL_FTP": row[41] or "", "DOORDASH_MD5HASH_FTP": row[42] or "",
                     "DOORDASH_EMAIL_FILECOUNT": row[43], "DOORDASH_MD5HASH_FILECOUNT": row[44],
+                    "GREEN_MERGE_STATUS": row[45] or "", "BLUE_MERGE_STATUS": row[46] or "",
+                    "ARCAMAX_MERGE_STATUS": row[47] or "", "ORANGE_MERGE_STATUS": row[48] or "",
+                    "APPTNESS_MERGE_STATUS": row[49] or "",
+                    "DOORDASH_EMAIL_FILEPATH": row[50] or "", "DOORDASH_MD5HASH_FILEPATH": row[51] or "",
+                    "DOORDASH_EMAIL_MERGE_STATUS": row[52] or "", "DOORDASH_MD5HASH_MERGE_STATUS": row[53] or "",
                 })
             return results
     finally:
@@ -1168,12 +1192,16 @@ def submit_request():
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id FROM requests WHERE request_name=%s AND overall_status='completed'",
+                    "SELECT id, request_type FROM requests WHERE request_name=%s AND overall_status='completed'",
                     (merge_source_name,),
                 )
                 previous = cur.fetchone()
                 if not previous:
                     return jsonify({'ok': False, 'error': 'Previous Request Name must be a completed request.'}), 400
+                if request_type == 'Doordash' and previous[1] != 'Doordash':
+                    return jsonify({'ok': False, 'error': 'DoorDash output can be merged only with a completed DoorDash request.'}), 400
+                if request_type != 'Doordash' and previous[1] == 'Doordash':
+                    return jsonify({'ok': False, 'error': 'Suppression/Mailing output cannot be merged with a DoorDash request.'}), 400
                 merge_source_request_id = previous[0]
         finally:
             conn.close()
