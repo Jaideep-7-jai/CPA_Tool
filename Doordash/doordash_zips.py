@@ -78,7 +78,9 @@ def insert_complete_extract(request_id, channel_name, zip_staging_table, run_dir
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
         if channel_name in ("GREEN", "BLUE", "ARCAMAX"):
             inserted_count = _insert_into_perm_table(
-                perm_table, channel_name, zip_staging_table, ctx["comp_type"], log
+                perm_table, channel_name, zip_staging_table, ctx["comp_type"],
+                ctx["request_data"].get("responder_match"),
+                ctx["request_data"].get("responder_days"), log
             )
         elif channel_name == "APPTNESS":
             inserted_count = _insert_apptness_into_perm_table(
@@ -270,24 +272,16 @@ def process_doordash_zip_request(request_id: int, zip_file: str, channel, output
     except Exception as exc:
         log.warning(f"  Failed to drop ZIP staging table (non-fatal): {exc}")
 
-    total_records = sum(v.get("count", 0) for v in results.values() if isinstance(v, dict))
     if errors:
-        error_summary = "\n".join(
-            f"{channel_name}: {error}"
-            for channel_name, error in errors
-        )
+        error_summary = "\n".join(f"{channel_name}: {error}" for channel_name, error in errors)
         send_error_email(request_data, error_summary, run_dir)
         raise RuntimeError(f"Doordash request failed:\n{error_summary}")
-    
+
     notification_results = {
         **results,
-        **{
-            output["channel"]: output
-            for output in combined_outputs
-        },
+        **{output["channel"]: output for output in combined_outputs},
     }
-
-send_success_email(request_data, notification_results, run_dir)
+    send_success_email(request_data, notification_results, run_dir)
 
 
 if __name__ == "__main__":
