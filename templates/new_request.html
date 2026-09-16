@@ -51,7 +51,7 @@
       <!-- 4. Criteria Type -->
       <div class="form-group">
         <label for="criteria_type"><i class="bi bi-funnel-fill" style="color:var(--primary);margin-right:5px;"></i>Criteria Type</label>
-        <select name="criteria_type" id="criteria_type" required>
+        <select name="criteria_type" id="criteria_type" disabled>
           <option value="">-- Select Criteria --</option>
           <option value="age">🎂 Age</option>
           <option value="state">🗺️ State</option>
@@ -62,7 +62,7 @@
       <!-- 5. Criteria Value -->
       <div class="form-group" id="criteriaValueGroup">
         <label for="criteria_value" id="criteriaValueLabel"><i class="bi bi-input-cursor-text" style="color:var(--primary);margin-right:5px;"></i>Criteria Value</label>
-        <input type="text" name="criteria_value" id="criteria_value"
+        <input type="text" name="criteria_value" id="criteria_value" disabled
                placeholder="e.g. 55 for Age, CA,TX for State">
         <small id="criteriaValueHint">Enter the value for the selected criteria type.</small>
       </div>
@@ -70,7 +70,7 @@
       <!-- 6. Comp Type -->
       <div class="form-group" id="compTypeGroup">
         <label for="comp_type"><i class="bi bi-sliders" style="color:var(--primary);margin-right:5px;"></i>Comp Type</label>
-        <select name="comp_type" id="comp_type" required>
+        <select name="comp_type" id="comp_type" disabled>
           <option value="include">Include</option>
           <option value="exclude">Exclude</option>
           <option value="greater">Greater Than or Equal To (Age)</option>
@@ -90,10 +90,24 @@
         <small>Matching any selected criterion includes the record.</small>
       </div>
 
-      <!-- 5. Merge existing output -->
+      <!-- 5. Optional responder match -->
+      <div class="form-group" id="responderMatchGroup">
+        <label class="merge-toggle-label">
+          <input type="checkbox" name="responder_match" value="1" id="responder_match">
+          <span>Responder Match</span>
+        </label>
+        <div id="responderDaysFields" class="hidden">
+          <input type="number" name="responder_days" id="responder_days"
+                 min="1" step="1" inputmode="numeric"
+                 placeholder="Enter responder lookback days">
+          <small>Include responders who opened within the specified number of days.</small>
+        </div>
+      </div>
+
+      <!-- 6. Merge existing output -->
       <div class="form-group merge-request-group">
         <label class="merge-toggle-label">
-          <input type="checkbox" id="merge_enabled">
+          <input type="checkbox" name="merge_enabled" value="1" id="merge_enabled">
           <span>Merge Previous Output</span>
         </label>
         <div id="mergeRequestFields" class="hidden">
