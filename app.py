@@ -106,11 +106,15 @@ def init_db():
                     request_type    ENUM('Suppression','Mailing','Doordash') NOT NULL DEFAULT 'Suppression',
                     client_name     VARCHAR(255) NOT NULL DEFAULT '',
                     created_by      INT NOT NULL,
-                    criteria_type   ENUM('age','state','zips') NOT NULL,
-                    comp_type       ENUM('greater','less','include','exclude') NOT NULL DEFAULT 'include',
+                    criteria_type   VARCHAR(50) NOT NULL,
+                    comp_type       VARCHAR(20) NOT NULL DEFAULT 'include',
                     channel         VARCHAR(100) NOT NULL DEFAULT 'ALL',
                     criteria_value  VARCHAR(500) NULL,
                     zip_file_path   VARCHAR(500) NULL,
+                    criteria_json   MEDIUMTEXT NULL,
+                    merge_source_request_id BIGINT NULL,
+                    responder_match TINYINT(1) NOT NULL DEFAULT 0,
+                    responder_days  INT NULL,
                     output_dir      VARCHAR(255) NOT NULL,
                     overall_status  ENUM('inprogress','completed','failed') NOT NULL DEFAULT 'inprogress',
                     GREEN_STATUS    VARCHAR(50)  NULL,
@@ -159,6 +163,14 @@ def init_db():
             # Fix channel: ENUM -> VARCHAR so 'GREEN,ORANGE' is stored correctly
             _modify_column_if_enum(cur, "requests", "channel",
                                    "VARCHAR(100) NOT NULL DEFAULT 'ALL'")
+            _modify_column_if_enum(cur, "requests", "criteria_type",
+                                   "VARCHAR(50) NOT NULL")
+            _modify_column_if_enum(cur, "requests", "comp_type",
+                                   "VARCHAR(20) NOT NULL DEFAULT 'include'")
+            _add_column_if_missing(cur, "requests", "criteria_json", "MEDIUMTEXT NULL")
+            _add_column_if_missing(cur, "requests", "merge_source_request_id", "BIGINT NULL")
+            _add_column_if_missing(cur, "requests", "responder_match", "TINYINT(1) NOT NULL DEFAULT 0")
+            _add_column_if_missing(cur, "requests", "responder_days", "INT NULL")
 
             _add_column_if_missing(cur, "requests", "APPTNESS_STATUS", "VARCHAR(50) NULL")
             _add_column_if_missing(cur, "requests", "APPTNESS_FTP", "VARCHAR(500) NULL")
@@ -203,6 +215,18 @@ def init_db():
                     updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                                              ON UPDATE CURRENT_TIMESTAMP,
                     UNIQUE KEY uq_requestid (requestid)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS request_criteria (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    request_id INT NOT NULL,
+                    criteria_type VARCHAR(50) NOT NULL,
+                    comparison_type VARCHAR(50) NOT NULL,
+                    criteria_value MEDIUMTEXT NULL,
+                    zip_file_path VARCHAR(500) NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (request_id) REFERENCES requests(id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
             admin_user = os.getenv("APP_DEFAULT_ADMIN", "admin")
@@ -346,18 +370,22 @@ def insert_request(record):
                 INSERT INTO requests (
                     request_uuid, request_name, request_type, client_name,
                     created_by, criteria_type, comp_type, channel,
-                    criteria_value, zip_file_path, output_dir, overall_status,
+                    criteria_value, zip_file_path, criteria_json, merge_source_request_id,
+                    responder_match, responder_days,
+                    output_dir, overall_status,
                     command_text, log_file, stdout_text, stderr_text,
                     return_code, started_at, finished_at,
                     GREEN_STATUS, BLUE_STATUS, ARCAMAX_STATUS, ORANGE_STATUS,
                     APPTNESS_STATUS
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
                     record["request_uuid"], record["request_name"], record["request_type"],
                     record["client_name"], record["created_by"], record["criteria_type"],
                     record["comp_type"], channel_val, record.get("criteria_value"),
-                    record.get("zip_file_path"), record["output_dir"], record["overall_status"],
+                    record.get("zip_file_path"), record.get("criteria_json"),
+                    record.get("merge_source_request_id"), int(bool(record.get("responder_match"))),
+                    record.get("responder_days"), record["output_dir"], record["overall_status"],
                     record.get("command_text"), record.get("log_file"),
                     record.get("stdout_text", ""), record.get("stderr_text", ""),
                     record.get("return_code"), record.get("started_at"), record.get("finished_at"),
@@ -660,7 +688,9 @@ def build_command(payload, db_id, uploaded_zip=None):
     for ch in channels:
         cmd.extend(["--channel", ch])
 
-    if criteria in ("age", "state"):
+    if criteria == "multi":
+        cmd.extend(["--request-id", str(db_id)])
+    elif criteria in ("age", "state"):
         cmd.extend(["--request-id", str(db_id)])
         if criteria == "age":
             cmd.extend(["--age", str(payload["criteria_value"])])
@@ -987,6 +1017,26 @@ def submit_request():
     criteria_type  = form.get('criteria_type', '').strip().lower()
     comp_type      = form.get('comp_type', '').strip().lower()
     criteria_value = form.get('criteria_value', '').strip()
+    criteria_items = []
+    criteria_json_raw = form.get('criteria_json', '').strip()
+    merge_enabled = form.get('merge_enabled') in {'1', 'true', 'on'}
+    merge_source_name = form.get('merge_source_request_name', '').strip()
+    responder_match = form.get('responder_match') in {'1', 'true', 'on'}
+    responder_days_raw = form.get('responder_days', '').strip()
+    responder_days = None
+
+    if responder_match:
+        if not responder_days_raw.isdigit() or int(responder_days_raw) < 1:
+            return jsonify({'ok': False, 'error': 'Responder Match requires a whole number of days (minimum 1).'}), 400
+        responder_days = int(responder_days_raw)
+
+    if criteria_json_raw:
+        try:
+            criteria_items = json.loads(criteria_json_raw)
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'Criteria definition is invalid.'}), 400
+        if not isinstance(criteria_items, list) or not criteria_items:
+            return jsonify({'ok': False, 'error': 'Add at least one criterion.'}), 400
 
     # ── Read channel(s) ─────────────────────────────────────────────
     # The JS sends each selected channel as a separate field:
@@ -1007,7 +1057,24 @@ def submit_request():
         return jsonify({'ok': False, 'error': f'Request name "{request_name}" is already taken.'}), 400
     if request_type not in {'Suppression', 'Mailing', 'Doordash'}:
         return jsonify({'ok': False, 'error': 'Invalid request type.'}), 400
-    if criteria_type not in {'age', 'state', 'zips'}:
+    if criteria_items:
+        allowed_criteria = {'age', 'state', 'zips'}
+        criteria_types = [item.get('type') for item in criteria_items]
+        if len(criteria_items) > 3 or len(set(criteria_types)) != len(criteria_types):
+            return jsonify({
+                'ok': False,
+                'error': 'Use each criterion only once: Age, State, and ZIP (maximum three).'
+            }), 400
+        invalid_criteria = [item for item in criteria_items if item.get('type') not in allowed_criteria]
+        if invalid_criteria:
+            return jsonify({'ok': False, 'error': 'Criteria can use only Age, State, or ZIP.'}), 400
+        if len(criteria_items) == 1:
+            criteria_type = criteria_items[0].get('type', '')
+            comp_type = criteria_items[0].get('comparison', '')
+        else:
+            criteria_type = 'multi'
+            comp_type = 'include'
+    if criteria_type not in {'age', 'state', 'zips', 'multi'}:
         return jsonify({'ok': False, 'error': 'Criteria type must be age, state, or zips.'}), 400
 
     if request_type == 'Doordash':
@@ -1024,7 +1091,7 @@ def submit_request():
             'error': f'Client name "{client_name}" was already used today. Please use a different client name.'
         }), 400
 
-    if criteria_type == 'age' and comp_type not in {'greater', 'less'}:
+    if criteria_type == 'age' and comp_type not in {'greater', 'less', 'between'}:
         return jsonify({'ok': False, 'error': 'Age criteria requires comp type greater or less.'}), 400
     if criteria_type in {'state', 'zips'} and comp_type not in {'include', 'exclude'}:
         return jsonify({'ok': False, 'error': 'State/Zips criteria requires include or exclude comp type.'}), 400
@@ -1038,7 +1105,41 @@ def submit_request():
     if invalid:
         return jsonify({'ok': False, 'error': f'Invalid channel(s): {", ".join(invalid)}. Choose from {sorted(valid_channels)}.'}), 400
 
-    if criteria_type == 'age':
+    if criteria_items:
+        zip_items = [item for item in criteria_items if item.get('type') == 'zips']
+        for item in criteria_items:
+            item_type = item.get('type')
+            comparison = item.get('comparison', '')
+            if item_type == 'age':
+                if comparison == 'between':
+                    if not str(item.get('from', '')).isdigit() or not str(item.get('to', '')).isdigit():
+                        return jsonify({'ok': False, 'error': 'Age Between requires From Age and To Age.'}), 400
+                elif comparison in {'greater', 'less'}:
+                    if not str(item.get('value', '')).isdigit():
+                        return jsonify({'ok': False, 'error': 'Age value must be a number.'}), 400
+                else:
+                    return jsonify({'ok': False, 'error': 'Age must be Greater Than, Lesser Than, or Between.'}), 400
+            elif item_type == 'state':
+                if item.get('comparison') not in {'include', 'exclude'} or not item.get('values'):
+                    return jsonify({'ok': False, 'error': 'State requires Include/Exclude and at least one state.'}), 400
+            elif item_type == 'zips' and item.get('comparison') not in {'include', 'exclude'}:
+                return jsonify({'ok': False, 'error': 'ZIP requires Include or Exclude.'}), 400
+        if len(criteria_items) == 1:
+            item = criteria_items[0]
+            criteria_type = item['type']
+            comp_type = item['comparison']
+            if criteria_type == 'age':
+                criteria_value = (
+                    '{0},{1}'.format(item['from'], item['to'])
+                    if comp_type == 'between' else str(item['value'])
+                )
+            elif criteria_type == 'state':
+                criteria_value = ','.join(item['values'])
+            else:
+                criteria_value = None
+        else:
+            criteria_value = 'Multiple criteria (OR)'
+    elif criteria_type == 'age':
         if not criteria_value.isdigit():
             return jsonify({'ok': False, 'error': 'Valid age number is required.'}), 400
     elif criteria_type == 'state':
@@ -1050,12 +1151,33 @@ def submit_request():
         criteria_value = None
 
     saved_zip = None
-    if criteria_type == 'zips':
+    if criteria_type == 'zips' or (criteria_items and any(item.get('type') == 'zips' for item in criteria_items)):
         if not zip_file_upload or not zip_file_upload.filename:
             return jsonify({'ok': False, 'error': 'A ZIP codes file is required for zips/Doordash requests.'}), 400
         suffix = Path(zip_file_upload.filename).suffix or '.csv'
         saved_zip = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
         zip_file_upload.save(saved_zip)
+        for item in criteria_items:
+            if item.get('type') == 'zips':
+                item['file_path'] = str(saved_zip)
+
+    merge_source_request_id = None
+    if merge_enabled:
+        if not merge_source_name:
+            return jsonify({'ok': False, 'error': 'Previous Request Name is required when Merge Previous Output is selected.'}), 400
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM requests WHERE request_name=%s AND overall_status='completed'",
+                    (merge_source_name,),
+                )
+                previous = cur.fetchone()
+                if not previous:
+                    return jsonify({'ok': False, 'error': 'Previous Request Name must be a completed request.'}), 400
+                merge_source_request_id = previous[0]
+        finally:
+            conn.close()
 
     safe_name  = "".join(c if c.isalnum() or c in '-_' else '_' for c in request_name)
     output_dir = str(BASE_DIR / "output" / safe_name)
@@ -1069,6 +1191,7 @@ def submit_request():
         "comp_type":      comp_type,
         "channel":        channel_str,
         "criteria_value": criteria_value,
+        "criteria_json":  json.dumps(criteria_items) if criteria_items else None,
         "output_dir":     output_dir,
     }
 
@@ -1085,6 +1208,10 @@ def submit_request():
         "channel":        channel_str,
         "criteria_value": criteria_value,
         "zip_file_path":  str(saved_zip) if saved_zip else None,
+        "criteria_json":  json.dumps(criteria_items) if criteria_items else None,
+        "merge_source_request_id": merge_source_request_id,
+        "responder_match": responder_match,
+        "responder_days": responder_days,
         "output_dir":     output_dir,
         "overall_status": "inprogress",
         "command_text":   None,
@@ -1095,6 +1222,22 @@ def submit_request():
         "started_at":     None,
         "finished_at":    None,
     })
+
+    if criteria_items:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                for item in criteria_items:
+                    value = item.get('values') or item.get('value') or {
+                        'from': item.get('from'), 'to': item.get('to')
+                    }
+                    cur.execute(
+                        "INSERT INTO request_criteria (request_id, criteria_type, comparison_type, criteria_value, zip_file_path) VALUES (%s,%s,%s,%s,%s)",
+                        (db_id, item.get('type'), item.get('comparison'), json.dumps(value), item.get('file_path')),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
 
     cmd = build_command(payload, db_id, saved_zip)
     update_request_db(request_uuid, command_text=" ".join(shlex.quote(c) for c in cmd))
