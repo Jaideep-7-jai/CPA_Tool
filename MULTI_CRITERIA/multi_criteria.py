@@ -168,9 +168,9 @@ def _responder_join(channel, responder_match, responder_days):
 def _create_channel_table(perm_table, channel, criteria, zip_staging_table,
                           responder_match, responder_days, log):
     condition = _criteria_conditions(channel, criteria, zip_staging_table)
+    responder_join = _responder_join(channel, responder_match, responder_days)
     if channel in ("GREEN", "BLUE"):
         profile_table = "GREEN_LPT.UNIVERSAL_PROFILE" if channel == "GREEN" else "INFS_LPT.INFS_PROFILE"
-        responder_join = _responder_join(channel, responder_match, responder_days)
         sql = (
             "CREATE OR REPLACE TABLE {perm} AS "
             "SELECT a.email, b.ZIP FROM {profile} a "
@@ -179,7 +179,6 @@ def _create_channel_table(perm_table, channel, criteria, zip_staging_table,
             "WHERE {condition};"
         ).format(perm=perm_table, profile=profile_table, responder_join=responder_join, condition=condition)
     elif channel == "ARCAMAX":
-        responder_join = _responder_join(channel, responder_match, responder_days)
         sql = (
             "CREATE OR REPLACE TABLE {perm} AS "
             "SELECT email, ZIP FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
