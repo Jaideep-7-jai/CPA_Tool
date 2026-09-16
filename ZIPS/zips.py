@@ -71,6 +71,7 @@ from utils import (
     send_error_email,
     ensure_output_dir,
 )
+from MERGE_OUTPUT.merge_output import merge_current_file
 
 DB_CONFIG = {
     "host":      "",
@@ -192,7 +193,8 @@ def fetch_request_details(request_id):
                     comp_type,
                     output_dir,
                     responder_match,
-                    responder_days
+                    responder_days,
+                    merge_source_request_id
                 FROM requests
                 WHERE id=%s
                 """,
@@ -854,6 +856,14 @@ def process_green_blue_zip(request_id, channel_name, zip_staging_table, run_dir:
         dest_file = final_files_dir / ctx["output_file"]
         shutil.move(str(src_file), str(dest_file))
         record_count = _count_file_lines(str(dest_file))
+        update_channel_storage(request_id, channel_name, path_FINAL, record_count, log)
+        merge_mode = ""
+        if ctx["request_data"].get("merge_source_request_id"):
+            merge_result = merge_current_file(
+                request_id, ctx["request_data"]["merge_source_request_id"], channel_name,
+                dest_file, path_FINAL, channel_tmp, log
+            )
+            record_count, merge_mode = merge_result["count"], merge_result["merge_mode"]
         log.info(f"  STEP 6 DONE: Moved {src_file.name} -> FINAL_FILES/  |  rows: {record_count:,}")
 
         # ── STEP 7/7 ──────────────────────────────────────────────────────
@@ -875,9 +885,11 @@ def process_green_blue_zip(request_id, channel_name, zip_staging_table, run_dir:
         log.info("=" * 70)
 
         _cleanup_channel_tmp(channel_tmp, log)
-        return _success_result(
+        result = _success_result(
             channel_name, ctx["output_file"], str(dest_file), elapsed, record_count
         )
+        result["merge_mode"] = merge_mode
+        return result
 
     except Exception:
         update_request_status(request_id, "Failed", channel_status, log)
@@ -975,6 +987,14 @@ def process_arcamax_zip(request_id, zip_staging_table, run_dir: Path):
         dest_file = final_files_dir / ctx["output_file"]
         shutil.move(str(src_file), str(dest_file))
         record_count = _count_file_lines(str(dest_file))
+        update_channel_storage(request_id, channel_name, path_FINAL, record_count, log)
+        merge_mode = ""
+        if ctx["request_data"].get("merge_source_request_id"):
+            merge_result = merge_current_file(
+                request_id, ctx["request_data"]["merge_source_request_id"], channel_name,
+                dest_file, path_FINAL, channel_tmp, log
+            )
+            record_count, merge_mode = merge_result["count"], merge_result["merge_mode"]
         log.info(f"  STEP 6 DONE: Moved {src_file.name} -> FINAL_FILES/  |  rows: {record_count:,}")
 
         # ── STEP 7/7 ──────────────────────────────────────────────────────
@@ -996,9 +1016,11 @@ def process_arcamax_zip(request_id, zip_staging_table, run_dir: Path):
         log.info("=" * 70)
 
         _cleanup_channel_tmp(channel_tmp, log)
-        return _success_result(
+        result = _success_result(
             channel_name, ctx["output_file"], str(dest_file), elapsed, record_count
         )
+        result["merge_mode"] = merge_mode
+        return result
 
     except Exception:
         update_request_status(request_id, "Failed", channel_status, log)
@@ -1089,15 +1111,23 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
             path_FINAL, download_dir, channel_tmp,
             ctx["output_file"], channel_name, log
         )
+        combined_path = channel_tmp / ctx["output_file"]
+        update_channel_storage(request_id, channel_name, path_FINAL, combined_count, log)
+        merge_mode = ""
+        if ctx["request_data"].get("merge_source_request_id"):
+            merge_result = merge_current_file(
+                request_id, ctx["request_data"]["merge_source_request_id"], channel_name,
+                combined_path, path_FINAL, channel_tmp, log
+            )
+            combined_count, merge_mode = merge_result["count"], merge_result["merge_mode"]
         log.info(f"  STEP 5 DONE: Combined file rows: {combined_count:,}")
 
         # ── STEP 6/7 ── Split per-ESP + ZIP archive ────────────────────────
         _step(log, 6, TOTAL_STEPS, "Splitting ORANGE file per-ESP + creating ZIP archive", channel_name)
         # combined CSV was written by _download_and_combine into channel_tmp/output_file
-        combined_path = channel_tmp / ctx["output_file"]
         df_final = pd.read_csv(
-            str(combined_path),
-            names=["email", "account_name"], delimiter="|", skiprows=1
+            str(combined_path), sep="|", header=0,
+            names=["email", "account_name"], dtype=str,
         )
         esp_names   = df_final["account_name"].drop_duplicates().sort_values().tolist()
         total_count = len(df_final)
@@ -1152,9 +1182,11 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
         log.info(f"  FTP path (supp) : {ftp_path_supp}")
         log.info("=" * 70)
 
-        return _success_result(
+        result = _success_result(
             channel_name, zip_out_name, str(zip_out), elapsed, total_count
         )
+        result["merge_mode"] = merge_mode
+        return result
 
     except Exception:
         update_request_status(request_id, "Failed", channel_status, log)
