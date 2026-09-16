@@ -19,13 +19,15 @@ CREATE TABLE IF NOT EXISTS requests (
     client_name     VARCHAR(255) NOT NULL DEFAULT '',
     created_by      INT NOT NULL,
     criteria_type   VARCHAR(50) NOT NULL,
-    comp_type       ENUM('greater','less','include','exclude') NOT NULL DEFAULT 'include',
+    comp_type       VARCHAR(20) NOT NULL DEFAULT 'include',
     -- VARCHAR instead of ENUM so multi-channel strings like 'GREEN,ORANGE' are stored correctly
     channel         VARCHAR(100) NOT NULL DEFAULT 'ALL',
     criteria_value  VARCHAR(500) NULL COMMENT 'age value or state list; NULL for zips/doordash',
     zip_file_path   VARCHAR(500) NULL,
     criteria_json   MEDIUMTEXT NULL,
     merge_source_request_id BIGINT NULL,
+    responder_match TINYINT(1) NOT NULL DEFAULT 0,
+    responder_days  INT NULL,
     output_dir      VARCHAR(255) NOT NULL,
     overall_status  ENUM('inprogress','completed','failed') NOT NULL DEFAULT 'inprogress',
     GREEN_STATUS    VARCHAR(50)  NULL,
@@ -63,12 +65,15 @@ CREATE TABLE IF NOT EXISTS requests (
 -- Fix channel column: ENUM -> VARCHAR so multi-channel values like 'GREEN,ORANGE' work
 ALTER TABLE requests MODIFY COLUMN channel VARCHAR(100) NOT NULL DEFAULT 'ALL';
 ALTER TABLE requests MODIFY COLUMN criteria_type VARCHAR(50) NOT NULL;
+ALTER TABLE requests MODIFY COLUMN comp_type VARCHAR(20) NOT NULL DEFAULT 'include';
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS criteria_json MEDIUMTEXT NULL;
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS merge_source_request_id BIGINT NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS responder_match TINYINT(1) NOT NULL DEFAULT 0;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS responder_days INT NULL;
 
 CREATE TABLE IF NOT EXISTS request_criteria (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    request_id BIGINT NOT NULL,
+    request_id INT NOT NULL,
     criteria_type VARCHAR(50) NOT NULL,
     comparison_type VARCHAR(50) NOT NULL,
     criteria_value MEDIUMTEXT NULL,
