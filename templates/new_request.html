@@ -170,7 +170,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='request-form.js') }}" defer></script>
+<script src="{{ url_for('static', filename='request-form.js') }}?v=20260916-criteria-limit" defer></script>
 <script>
 // Sync checkbox → visual "checked" class
 document.querySelectorAll('.channel-option').forEach(lbl => {
