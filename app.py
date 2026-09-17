@@ -24,19 +24,17 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "")
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-this-secret")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
-
 DB_CONFIG = {
-    "host": "",
-    "user": "",
-    "password": "",
-    "database": "",
+    "host": "zds-prod-jbdb3-vip.bo3.e-dialog.com",
+    "user": "techuser",
+    "password": "tech12#$",
+    "database": "CUST_TECH_DB",
     "charset": "utf8mb4",
     "autocommit": True,
 }
-
 
 SCRIPT_NAME = os.getenv("SUPPRESSION_SCRIPT_PATH", str(BASE_DIR / "main.py"))
 PYTHON_BIN = os.getenv("APP_PYTHON_BIN", "python3.9")
@@ -524,15 +522,23 @@ def fetch_all_requests(limit=200, username=None):
                     r.GREEN_MERGE_STATUS, r.BLUE_MERGE_STATUS, r.ARCAMAX_MERGE_STATUS,
                     r.ORANGE_MERGE_STATUS, r.APPTNESS_MERGE_STATUS,
                     r.DOORDASH_EMAIL_FILEPATH, r.DOORDASH_MD5HASH_FILEPATH,
-                    r.DOORDASH_EMAIL_MERGE_STATUS, r.DOORDASH_MD5HASH_MERGE_STATUS
+                    r.DOORDASH_EMAIL_MERGE_STATUS, r.DOORDASH_MD5HASH_MERGE_STATUS, r.criteria_json,
+                    r.responder_match, r.responder_days, r.merge_source_request_id, merge_source.request_name AS merge_source_request_name
                 FROM requests r
                 JOIN users u ON u.id = r.created_by
+                LEFT JOIN requests merge_source ON merge_source.id = r.merge_source_request_id
                 {scope}
                 ORDER BY r.id DESC LIMIT %s
             """.format(scope=_request_scope(username)[0]), tuple(_request_scope(username)[1] + [limit]))
             rows = cur.fetchall()
             results = []
             for row in rows:
+                criteria_value_display, comp_type_display = _criteria_display(
+                    row[4],   # criteria_type
+                    row[7],   # criteria_value
+                    row[5],   # comp_type
+                    row[54],  # criteria_json
+                )
                 results.append({
                     "request_uuid":     row[0],
                     "request_name":     row[1],
@@ -577,11 +583,79 @@ def fetch_all_requests(limit=200, username=None):
                     "APPTNESS_MERGE_STATUS": row[49] or "",
                     "DOORDASH_EMAIL_FILEPATH": row[50] or "", "DOORDASH_MD5HASH_FILEPATH": row[51] or "",
                     "DOORDASH_EMAIL_MERGE_STATUS": row[52] or "", "DOORDASH_MD5HASH_MERGE_STATUS": row[53] or "",
+                    "criteria_value_display": criteria_value_display,
+                    "comp_type_display": comp_type_display,
+                    "responder_match": bool(row[55]),
+                    "responder_days": row[56],
+                    "merge_source_request_id": row[57],
+                    "merge_source_request_name": row[58] or ""
                 })
             return results
     finally:
         conn.close()
 
+
+def _criteria_display(criteria_type, criteria_value, comp_type, criteria_json):
+    if criteria_type != "multi":
+        return criteria_value or "-", comp_type or "-"
+
+    try:
+        items = json.loads(criteria_json or "[]")
+    except (TypeError, ValueError):
+        return criteria_value or "-", comp_type or "-"
+
+    value_parts = []
+    comp_parts = []
+
+    labels = {
+        "age": "Age",
+        "state": "State",
+        "zips": "ZIP",
+    }
+    comp_labels = {
+        "greater": "Greater Than",
+        "less": "Lesser Than",
+        "between": "Between",
+        "include": "Include",
+        "exclude": "Exclude",
+    }
+
+    for item in items:
+        item_type = (item.get("type") or "").lower()
+        label = labels.get(item_type, item_type.title())
+        comparison = (item.get("comparison") or "").lower()
+
+        if item_type == "age":
+            if comparison == "between":
+                value = "{0} to {1}".format(
+                    item.get("from", ""),
+                    item.get("to", "")
+                )
+            else:
+                value = item.get("value", "")
+        elif item_type == "state":
+            value = ", ".join(item.get("values") or [])
+        elif item_type == "zips":
+            zip_path = item.get("file_path") or item.get("zip_file_path") or ""
+            value = Path(zip_path).name if zip_path else "Uploaded ZIP file"
+        else:
+            value = ""
+
+        if value:
+            value_parts.append("{0}: {1}".format(label, value))
+
+        if comparison:
+            comp_parts.append(
+                "{0}: {1}".format(
+                    label,
+                    comp_labels.get(comparison, comparison.title())
+                )
+            )
+
+    return (
+        " | ".join(value_parts) or criteria_value or "-",
+        " | ".join(comp_parts) or comp_type or "-",
+    )
 
 
 def fetch_dashboard_stats(username=None):
@@ -989,66 +1063,6 @@ def api_check_client_name():
         return jsonify({'available': False, 'error': 'Client Name is empty'})
     taken = is_client_name_taken_today(client_name)
     return jsonify({'available': not taken})
-
-
-@app.route('/api/check-merge-source')
-@login_required
-def api_check_merge_source():
-    """Validate a completed request selected as the merge source.
-
-    This is UI feedback only. ``submit_request`` repeats the same validation
-    before it creates a request, so a modified browser request cannot bypass it.
-    """
-    source_name = request.args.get('name', '').strip()
-    current_type = request.args.get('request_type', '').strip()
-
-    if not source_name:
-        return jsonify({
-            'available': False,
-            'message': 'Enter the completed previous request name.'
-        })
-    if current_type not in {'Suppression', 'Mailing', 'Doordash'}:
-        return jsonify({
-            'available': False,
-            'message': 'Select a valid request type first.'
-        })
-
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT request_type FROM requests "
-                "WHERE request_name=%s AND overall_status='completed'",
-                (source_name,),
-            )
-            previous = cur.fetchone()
-    finally:
-        conn.close()
-
-    if not previous:
-        return jsonify({
-            'available': False,
-            'message': 'Previous Request Name must be a completed request.'
-        })
-
-    previous_type = previous[0]
-    if current_type == 'Doordash' and previous_type != 'Doordash':
-        return jsonify({
-            'available': False,
-            'message': 'DoorDash output can be merged only with a completed DoorDash request.'
-        })
-    if current_type != 'Doordash' and previous_type == 'Doordash':
-        return jsonify({
-            'available': False,
-            'message': 'Suppression/Mailing output cannot be merged with a DoorDash request.'
-        })
-
-    label = (
-        'Eligible completed DoorDash request.'
-        if current_type == 'Doordash'
-        else 'Eligible completed previous request.'
-    )
-    return jsonify({'available': True, 'message': label})
 
 
 
