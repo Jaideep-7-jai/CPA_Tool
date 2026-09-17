@@ -36,7 +36,8 @@ def parse_args():
     parser.add_argument("--output-dir",    required=True,
                         help="Output directory")
     # Criteria-specific args
-    parser.add_argument("--age",           type=int, default=None)
+    parser.add_argument("--age",default=None,
+                        help="Age value. A Between request uses the format minimum_age,maximum_age.",)
     parser.add_argument("--states",        nargs="+", default=None)
     parser.add_argument("--zip-file",      default=None,
                         help="Path to uploaded ZIP codes file")
