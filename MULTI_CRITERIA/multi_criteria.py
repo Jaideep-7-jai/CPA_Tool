@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from config import AWS_KEY_ID, AWS_SECRET_KEY, S3_BASE
+from config import AWS_KEY_ID, AWS_SECRET_KEY, S3_BASE, SNOWSQL_PASSPHRASE
 from utils import ensure_output_dir, run_command, send_error_email, send_success_email
 from MERGE_OUTPUT.merge_output import merge_current_file
 from AGE_STATE.age_state import (
@@ -144,27 +144,34 @@ def _criteria_conditions(channel, criteria, zip_staging_table):
     return "(" + " OR ".join(conditions) + ")"
 
 
-def _responder_join(channel, responder_match, responder_days):
+def _responder_join(channel_name, responder_match, responder_days):
     """Return the optional, deduplicated responder join for one channel."""
-    if not responder_match or channel not in ("GREEN", "BLUE", "ORANGE"):
+    if not responder_match or channel_name not in ("GREEN", "BLUE", "ORANGE"):
         return ""
+
     days = int(responder_days or 0)
     if days < 1:
-        raise ValueError("Responder Match requires responder_days to be at least 1.")
-    if channel in ("GREEN", "BLUE"):
+        raise ValueError(
+            "Responder Match requires responder_days to be at least 1."
+        )
+
+    if channel_name in ("GREEN", "BLUE"):
+        responder_channel = "GREEN" if channel_name == "GREEN" else "ORANGE"
+
         return (
             "JOIN (SELECT DISTINCT LOWER(TRIM(emailid)) AS email "
             "FROM GREEN.GREEN_LPT.RAW_OPENS_FOLLOWUP "
-            "WHERE opendate >= DATEADD(day, -{0}, CURRENT_DATE())) responders "
-            "ON LOWER(TRIM(a.email)) = responders.email ".format(days)
-        )
+            "WHERE CHANNELNAME = '{0}' "
+            "AND opendate >= DATEADD(day, -{1}, CURRENT_DATE())) responders "
+            "ON LOWER(TRIM(a.email)) = responders.email "
+        ).format(responder_channel, days)
+
     return (
         "JOIN (SELECT DISTINCT LOWER(TRIM(email)) AS email "
         "FROM GREEN.DT_DATA.APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND "
         "WHERE OPEN_DATE >= DATEADD(day, -{0}, CURRENT_DATE())) responders "
         "ON LOWER(TRIM(a.email_address)) = responders.email ".format(days)
     )
-
 
 def _create_channel_table(perm_table, channel, criteria, zip_staging_table,
                           responder_match, responder_days, log):
@@ -240,7 +247,7 @@ def _orange_mailing_zip(csv_file, final_files_dir):
 
 
 def _process_channel(request_data, criteria, zip_staging_table, run_dir, channel):
-    log = setup_channel_logging(run_dir, channel)
+    log = setup_channel_logging(run_dir, channel, "multi")
     request_id = request_data["id"]
     update_request_status(request_id, "Started", channel + "_STATUS", log)
     date_value = datetime.now().strftime("%Y%m%d")
@@ -318,6 +325,7 @@ def process_multi_criteria_request(request_id, channel, output_dir=None):
     run_dir = Path(ensure_output_dir(output_dir or request_data["output_dir"], "multi"))
     (run_dir / "FINAL_FILES").mkdir(parents=True, exist_ok=True)
     log = setup_main_logging(run_dir, "multi")
+    os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
     zip_items = [item for item in criteria if item.get("type") == "zips"]
     zip_staging_table = None
     try:
