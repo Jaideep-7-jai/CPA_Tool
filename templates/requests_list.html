@@ -16,6 +16,10 @@
 #requestsTable .request-details-panel { border-left: 4px solid #2563eb; border-radius: 0 9px 9px 0; background: #f8fbff; padding: 13px 15px; }
 #requestsTable .request-details-title { color: #172554; font-weight: 700; font-size: .82rem; margin-bottom: 10px; }
 #requestsTable .request-details-title span { color: #64748b; font-weight: 400; font-size: .74rem; margin-left: 8px; }
+#requestsTable .request-run-metadata { display: flex; flex-wrap: wrap; gap: 8px 12px; margin: 0 0 12px; }
+#requestsTable .request-run-metadata-item { display: inline-flex; align-items: baseline; gap: 6px; padding: 6px 9px; border: 1px solid #dbeafe; border-radius: 7px; background: #fff; color: #334155; font-size: .76rem; }
+#requestsTable .request-run-metadata-label { color: #64748b; font-weight: 700; }
+#requestsTable .request-run-metadata-value { color: #172554; font-weight: 700; }
 #requestsTable .channel-status-list { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 12px 22px; }
 #requestsTable .channel-status-item { display: inline-flex; flex-direction: row; align-items: center; gap: 7px; }
 #requestsTable .channel-status-name { color: #475569; font-size: .72rem; font-weight: 800; letter-spacing: .03em; }
@@ -54,13 +58,45 @@
               data-channels="{{ r.channel }}" data-search="{{ r.request_name }} {{ r.client_name }} {{ r.request_type }} {{ r.criteria_type }} {{ r.overall_status }}">
             <td><span class="expand-indicator" aria-hidden="true">⌄</span><strong>{{ r.request_name }}</strong></td>
             <td>{{ r.client_name }}</td><td><span class="badge-type {{ r.request_type|lower }}">{{ r.request_type }}</span></td><td><span class="badge-criteria">{{ r.criteria_type|upper }}</span></td>
-            {% set value = r.criteria_value or '-' %}
-            <td class="muted small">{% if value|length > 20 %}<span class="value-truncated" title="{{ value }}">{{ value[:20] }}&hellip;</span>{% else %}{{ value }}{% endif %}</td><td class="muted small">{{ r.comp_type }}</td><td><span class="tag">{{ r.channel }}</span></td>
+            {% set value = r.criteria_value_display or '-' %}
+            <td class="muted small">
+                {% if value|length > 20 %}
+                    <span class="value-truncated" title="{{ value }}">{{ value[:20] }}&hellip;</span>
+                {% else %}
+                    {{ value }}
+                {% endif %}
+            </td>
+            <td class="muted small">{{ r.comp_type_display or '-' }}</td>
+            <td><span class="tag">{{ r.channel }}</span></td>
             <td><span class="badge {{ r.overall_status|lower|replace(' ', '') }}">{{ r.overall_status }}</span></td><td>{{ r.username }}</td><td class="muted small">{{ r.created_at }}</td><td class="muted small">{{ r.finished_at or '-' }}</td>
           </tr>
           <tr id="{{ row_id }}" class="request-details-row" hidden><td colspan="11">
             <div class="request-details-panel">
               <div class="request-details-title">{% if r.request_type == 'Doordash' %}Doordash files{% else %}Channel status{% endif %}<span>Hover or click a pill to view file details</span></div>
+            <div class="request-run-metadata">
+              <div class="request-run-metadata-item">
+                <span class="request-run-metadata-label">Responder Match:</span>
+                <span class="request-run-metadata-value">
+                  {% if r.responder_match %}
+                    Yes &mdash; {{ r.responder_days }} day{% if r.responder_days != 1 %}s{% endif %}
+                  {% else %}
+                    No
+                  {% endif %}
+                </span>
+              </div>
+
+              <div class="request-run-metadata-item">
+                <span class="request-run-metadata-label">Merged Previous Output:</span>
+                <span class="request-run-metadata-value">
+                  {% if r.merge_source_request_id %}
+                    Yes &mdash; {{ r.merge_source_request_name or 'Previous request' }}
+                    (ID: {{ r.merge_source_request_id }})
+                  {% else %}
+                    No
+                  {% endif %}
+                </span>
+             </div>
+           </div>
               <div class="channel-status-list">
               {% if r.request_type == 'Doordash' %}
                 {% set email_ready = r.DOORDASH_EMAIL_FTP or r.DOORDASH_EMAIL_FILECOUNT %}
