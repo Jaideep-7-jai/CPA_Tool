@@ -74,17 +74,17 @@ from utils import (
 from MERGE_OUTPUT.merge_output import merge_current_file
 
 DB_CONFIG = {
-    "host":      "",
-    "user":      "",
-    "password":  "",
-    "database":  "",
-    "charset":   "utf8mb4",
+    "host": "zds-prod-jbdb3-vip.bo3.e-dialog.com",
+    "user": "techuser",
+    "password": "tech12#$",
+    "database": "CUST_TECH_DB",
+    "charset": "utf8mb4",
     "autocommit": True,
 }
 
-FTP_USERNAME = ""
-FTP_PASSWORD = ""
-FTP_HOST = ""
+FTP_USERNAME = "GreenPub"
+FTP_PASSWORD = "Zet@Welcome1!"
+FTP_HOST = "zxds-ftp-02.bo3.e-dialog.com"
 
 CHANNELS = ["GREEN", "BLUE", "ARCAMAX", "ORANGE"]
 
@@ -475,23 +475,30 @@ def _responder_join(channel_name, responder_match, responder_days):
     """Return the optional, deduplicated responder join for one channel."""
     if not responder_match or channel_name not in ("GREEN", "BLUE", "ORANGE"):
         return ""
+
     days = int(responder_days or 0)
     if days < 1:
-        raise ValueError("Responder Match requires responder_days to be at least 1.")
+        raise ValueError(
+            "Responder Match requires responder_days to be at least 1."
+        )
+
     if channel_name in ("GREEN", "BLUE"):
+        responder_channel = "GREEN" if channel_name == "GREEN" else "ORANGE"
+
         return (
             "JOIN (SELECT DISTINCT LOWER(TRIM(emailid)) AS email "
             "FROM GREEN.GREEN_LPT.RAW_OPENS_FOLLOWUP "
-            "WHERE opendate >= DATEADD(day, -{0}, CURRENT_DATE())) responders "
-            "ON LOWER(TRIM(a.email)) = responders.email ".format(days)
-        )
+            "WHERE CHANNELNAME = '{0}' "
+            "AND opendate >= DATEADD(day, -{1}, CURRENT_DATE())) responders "
+            "ON LOWER(TRIM(a.email)) = responders.email "
+        ).format(responder_channel, days)
+
     return (
         "JOIN (SELECT DISTINCT LOWER(TRIM(email)) AS email "
         "FROM GREEN.DT_DATA.APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND "
         "WHERE OPEN_DATE >= DATEADD(day, -{0}, CURRENT_DATE())) responders "
         "ON LOWER(TRIM(a.email_address)) = responders.email ".format(days)
     )
-
 
 def _insert_into_perm_table(
     perm_table, channel_name, zip_staging_table, comp_type, responder_match,
