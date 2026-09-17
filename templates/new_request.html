@@ -120,12 +120,9 @@
           <span>Merge Previous Output</span>
         </label>
         <div id="mergeRequestFields" class="hidden">
-          <div class="input-with-status">
-            <input type="text" name="merge_source_request_name" id="merge_source_request_name"
-                   placeholder="Enter completed previous request name" autocomplete="off">
-            <span id="mergeSourceStatus" class="name-status"></span>
-          </div>
-          <small id="mergeSourceHint">Matching channel files are merged; the previous request remains unchanged.</small>
+          <input type="text" name="merge_source_request_name" id="merge_source_request_name"
+                 placeholder="Enter completed previous request name" autocomplete="off">
+          <small>Matching channel files are merged; the previous request remains unchanged.</small>
         </div>
       </div>
 
@@ -200,7 +197,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='request-form.js') }}?v=20260916-merge-source-check" defer></script>
+<script src="{{ url_for('static', filename='request-form.js') }}?v=20260916-doordash-zip" defer></script>
 <script>
 // Sync checkbox → visual "checked" class
 document.querySelectorAll('.channel-option').forEach(lbl => {
