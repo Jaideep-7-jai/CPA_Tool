@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS requests (
     comp_type       VARCHAR(20) NOT NULL DEFAULT 'include',
     -- VARCHAR instead of ENUM so multi-channel strings like 'GREEN,ORANGE' are stored correctly
     channel         VARCHAR(100) NOT NULL DEFAULT 'ALL',
-    criteria_value  VARCHAR(500) NULL COMMENT 'age value or state list; NULL for zips/doordash',
+    criteria_value  VARCHAR(500) NULL COMMENT 'legacy summary; criteria_json supports age/state/zips/gender combinations',
     zip_file_path   VARCHAR(500) NULL,
     criteria_json   MEDIUMTEXT NULL,
     merge_source_request_id BIGINT NULL,

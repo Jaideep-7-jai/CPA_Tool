@@ -1,78 +1,107 @@
 # CPA Request Portal
 
-This is a Flask + MySQL frontend for your existing suppression CLI script. Your current script already supports `--criteria age|state|zip`, `--comp`, `--age`, `--states`, `--zip-file`, and `--output-dir`, so the web app mirrors those same rules instead of replacing the underlying processing flow.[file:1]
+CPA Tool is a Flask/MySQL request portal with Snowflake, S3, and FTP-backed
+output processing. It has one unified processor for every non-DoorDash
+request and separate modules for DoorDash and previous-output merging.
 
-## Modules
+## Runtime modules
 
-### `app.py`
-Main Flask application. It handles login, session protection, MySQL reads/writes, request submission, file upload handling, background execution, and request status updates.[web:29][web:32]
+| Module | Responsibility |
+| --- | --- |
+| `app.py` | Validates the form, saves the request/criteria in MySQL, and starts `main.py` in the background. |
+| `main.py` | Routes DoorDash requests to the DoorDash processor; routes every Suppression/Mailing request to the consolidated processor. |
+| `REQUEST_PROCESSOR/request_processor.py` | Main non-DoorDash engine. Handles one or many Age, State, ZIP, and Gender criteria using OR logic, responder match, S3 exports, optional merge, Orange ESP output, FTP delivery, and detailed logs. |
+| `Doordash/doordash_zips.py` | DoorDash ZIP workflow. It imports only common low-level helpers from the consolidated processor and does not depend on a `ZIPS` module. |
+| `MERGE_OUTPUT/merge_output.py` | Merges compatible current/previous S3 files in Snowflake so large files are never loaded into pandas. |
+| `utils.py` | Shared command execution, output-directory, and notification helpers. |
 
-### `templates/login.html`
-Login page shown before the user can access the app. It posts username and password to Flask and displays login errors if credentials fail.[web:29]
+The old `AGE_STATE`, `ZIPS`, and `MULTI_CRITERIA` runtime modules are retired.
 
-### `templates/home.html`
-Authenticated home page. The main panel contains only the create-request form, and the sidebar shows all created requests, matching your requested layout.[web:32]
+## Request routing
 
-### `static/app.js`
-Frontend controller for the home page. It changes comparison values based on criteria, shows and hides the correct inputs, submits the form using `fetch`, resets the form after success, and refreshes the sidebar list periodically.[web:31]
+1. The UI builds `criteria_json` from selected Age, State, ZIP, and/or Gender
+   rows. A criterion can be selected once; matching uses OR logic.
+2. `app.py` validates request/client-name uniqueness, responder days,
+   optional merge eligibility, criteria values, channels, and ZIP uploads.
+3. `main.py` receives the saved request ID.
+4. For `Suppression` and `Mailing`, `main.py` calls
+   `REQUEST_PROCESSOR.request_processor.process_request`.
+5. For `Doordash`, `main.py` calls
+   `Doordash.doordash_zips.process_doordash_zip_request`.
 
-### `static/style.css`
-App styling for login page, home page, sidebar, form, status badges, and responsive layout.
+## Consolidated processor flow
 
-### `schema.sql`
-MySQL schema for the `users` and `requests` tables.
+For a non-DoorDash request the processor:
 
-### `requirements.txt`
-Python dependencies needed to run the app.
+1. Reads the persisted request and normalized criteria JSON from MySQL.
+2. Uploads and loads a shared Snowflake ZIP staging table only when a ZIP
+   criterion is present.
+3. Builds one per-channel Snowflake query with an OR predicate across all
+   selected criteria.
+4. Applies an optional responder join. Green uses `CHANNELNAME='GREEN'` and
+   Blue uses `CHANNELNAME='ORANGE'` in `RAW_OPENS_FOLLOWUP`.
+5. Exports FINAL and COMPLETE datasets to S3, then drops temporary Snowflake
+   tables.
+6. Downloads the final data, optionally merges a compatible previous request
+   in Snowflake, then writes delivery artifacts.
+7. Creates Orange delivery output from account/ESP data: email-only for
+   Suppression and one ESP file per account inside a ZIP for Mailing.
+8. Posts deliverables to FTP, stores S3/FTP/count metadata, updates status,
+   sends notification, and removes temporary files/tables.
 
-## Flow
+Every major action is logged in the request's `logs/` directory.
 
-1. User opens `/login` and signs in using credentials stored in MySQL.[web:29]
-2. Flask checks the password hash with Werkzeug instead of comparing plain text passwords.[web:32]
-3. After login, Flask redirects to `/` and shows the create-request home page.[web:29]
-4. The user fills the request form. Validation follows the exact CLI rules from your script for age, state, and zip inputs.[file:1]
-5. When submitted, a new row is inserted into MySQL `requests` with initial status `inprogress`.[web:31]
-6. A background thread launches the real suppression script with the equivalent CLI command.[web:31]
-7. When execution ends, the request row is updated to `completed` or `failed` using the subprocess return code, and stdout/stderr/log file details are stored.[web:31][web:37]
-8. The sidebar polls `/api/requests` every 5 seconds so users can see current status changes without refreshing the page.[web:31]
-9. After a successful request, the form resets automatically so the create page is clean for the next submission.
+## Gender column configuration
 
-## Setup
-
-### Install packages
+Gender is supported by the request contract and the consolidated query
+builder. The default source columns are `b.GENDER` for Green/Blue, `GENDER`
+for Arcamax, and `a.GENDER` for Orange. Override any source-specific value
+without a code change using:
 
 ```bash
-pip3.6 install -r requirements.txt
+export CPA_GENDER_GREEN_COLUMN='b.GENDER'
+export CPA_GENDER_BLUE_COLUMN='b.GENDER'
+export CPA_GENDER_ARCAMAX_COLUMN='GENDER'
+export CPA_GENDER_ORANGE_COLUMN='a.GENDER'
 ```
 
-### Create database
+Confirm these columns against the Snowflake source schemas before enabling
+Gender in production.
+
+## Runtime configuration
+
+Database and FTP credentials are intentionally not stored in tracked
+application modules. Configure the service environment before starting Flask:
 
 ```bash
-mysql -u root -p < schema.sql
+export FLASK_SECRET_KEY='replace-with-a-random-value'
+export CPA_DB_HOST='…'
+export CPA_DB_USER='…'
+export CPA_DB_PASSWORD='…'
+export CPA_DB_NAME='CUST_TECH_DB'
+export CPA_FTP_USERNAME='…'
+export CPA_FTP_PASSWORD='…'
+export CPA_FTP_HOST='…'
 ```
 
-### Set environment variables
+Use `.env.example` as the variable reference. Existing Snowflake/S3 settings
+remain in the deployment's protected runtime configuration.
+
+## Local validation
 
 ```bash
-export APP_DB_HOST=localhost
-export APP_DB_USER=root
-export APP_DB_PASSWORD='your_password'
-export APP_DB_NAME=cpa_request_portal
-export FLASK_SECRET_KEY='change-me'
-export SUPPRESSION_SCRIPT_PATH='/full/path/to/main.py'
-export APP_DEFAULT_ADMIN='admin'
-export APP_DEFAULT_ADMIN_PASSWORD='admin123'
+python3.9 -m py_compile \
+  app.py main.py utils.py \
+  REQUEST_PROCESSOR/request_processor.py \
+  Doordash/doordash_zips.py \
+  MERGE_OUTPUT/merge_output.py
+
+node --check static/request-form.js
+git diff --check
 ```
 
-### Run
+Run the portal with the site's supported Python version, for example:
 
 ```bash
 python3.6 app.py
 ```
-
-The app is configured with `host='0.0.0.0'`, so access it using the server hostname or IP rather than `127.0.0.1` from your own desktop browser.[cite:1]
-
-## Notes
-
-- Replace `SUPPRESSION_SCRIPT_PATH` with your real existing script path if the CLI project is outside this web app folder.[file:1]
-- You can later add registration, per-user request filtering, request detail modal, and log viewing endpoints without changing the basic flow.[web:29][web:31]

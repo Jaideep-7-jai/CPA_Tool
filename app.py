@@ -24,17 +24,21 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-this-secret")
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
+
 DB_CONFIG = {
-    "host": "zds-prod-jbdb3-vip.bo3.e-dialog.com",
-    "user": "techuser",
-    "password": "tech12#$",
-    "database": "CUST_TECH_DB",
+    # Keep credentials outside the repository. Set these in the service
+    # environment (or its systemd/supervisor configuration) before startup.
+    "host": os.getenv("CPA_DB_HOST", ""),
+    "user": os.getenv("CPA_DB_USER", ""),
+    "password": os.getenv("CPA_DB_PASSWORD", ""),
+    "database": os.getenv("CPA_DB_NAME", "CUST_TECH_DB"),
     "charset": "utf8mb4",
     "autocommit": True,
 }
+
 
 SCRIPT_NAME = os.getenv("SUPPRESSION_SCRIPT_PATH", str(BASE_DIR / "main.py"))
 PYTHON_BIN = os.getenv("APP_PYTHON_BIN", "python3.9")
@@ -65,6 +69,13 @@ _PRIVILEGED_USERS = {"admin", "jaideep"}
 def get_db():
     if pymysql is None:
         raise RuntimeError("PyMySQL is not installed. Run: pip install pymysql")
+    missing = [key for key in ("host", "user", "password") if not DB_CONFIG[key]]
+    if missing:
+        raise RuntimeError(
+            "Missing database configuration: set "
+            + ", ".join("CPA_DB_" + key.upper() for key in missing)
+            + "."
+        )
     return pymysql.connect(**DB_CONFIG)
 
 
@@ -499,6 +510,64 @@ def _request_scope(username):
     return "WHERE u.username=%s", [username]
 
 
+def _criteria_display(criteria_type, criteria_value, comp_type, criteria_json):
+    """Return human-readable criterion values for the request registry.
+
+    Multi-criterion rows retain their one-column database summary for backwards
+    compatibility, but the UI should show each saved criterion and comparison
+    rather than the generic "Multiple criteria (OR)" text.
+    """
+    if str(criteria_type or '').lower() != 'multi':
+        return criteria_value or '-', comp_type or '-'
+
+    try:
+        items = json.loads(criteria_json or '[]')
+    except (TypeError, ValueError):
+        return criteria_value or '-', comp_type or '-'
+    if not isinstance(items, list) or not items:
+        return criteria_value or '-', comp_type or '-'
+
+    labels = {
+        'age': 'Age',
+        'state': 'State',
+        'zips': 'ZIP',
+        'zip': 'ZIP',
+        'gender': 'Gender',
+    }
+    comparison_labels = {
+        'greater': 'Greater Than',
+        'less': 'Lesser Than',
+        'between': 'Between',
+        'include': 'Include',
+        'exclude': 'Exclude',
+    }
+    value_parts = []
+    comparison_parts = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get('type') or '').lower()
+        label = labels.get(kind, kind.title() or 'Criterion')
+        comparison = str(item.get('comparison') or '').lower()
+        if kind == 'age' and comparison == 'between':
+            value = '{0}-{1}'.format(item.get('from', ''), item.get('to', ''))
+        elif kind in {'state', 'gender'}:
+            values = item.get('values') or []
+            if isinstance(values, str):
+                values = [value.strip() for value in values.split(',')]
+            value = ', '.join(str(value) for value in values if str(value).strip())
+        elif kind in {'zip', 'zips'}:
+            value = 'Uploaded ZIP file'
+        else:
+            value = str(item.get('value') or '-')
+        value_parts.append('{0}: {1}'.format(label, value or '-'))
+        comparison_parts.append('{0}: {1}'.format(
+            label, comparison_labels.get(comparison, comparison or '-')
+        ))
+    return (' | '.join(value_parts) or criteria_value or '-',
+            ' | '.join(comparison_parts) or comp_type or '-')
+
+
 def fetch_all_requests(limit=200, username=None):
     """Fetch all requests including per-channel statuses and file details."""
     conn = get_db()
@@ -522,8 +591,10 @@ def fetch_all_requests(limit=200, username=None):
                     r.GREEN_MERGE_STATUS, r.BLUE_MERGE_STATUS, r.ARCAMAX_MERGE_STATUS,
                     r.ORANGE_MERGE_STATUS, r.APPTNESS_MERGE_STATUS,
                     r.DOORDASH_EMAIL_FILEPATH, r.DOORDASH_MD5HASH_FILEPATH,
-                    r.DOORDASH_EMAIL_MERGE_STATUS, r.DOORDASH_MD5HASH_MERGE_STATUS, r.criteria_json,
-                    r.responder_match, r.responder_days, r.merge_source_request_id, merge_source.request_name AS merge_source_request_name
+                    r.DOORDASH_EMAIL_MERGE_STATUS, r.DOORDASH_MD5HASH_MERGE_STATUS,
+                    r.criteria_json, r.responder_match, r.responder_days,
+                    r.merge_source_request_id,
+                    merge_source.request_name AS merge_source_request_name
                 FROM requests r
                 JOIN users u ON u.id = r.created_by
                 LEFT JOIN requests merge_source ON merge_source.id = r.merge_source_request_id
@@ -534,10 +605,7 @@ def fetch_all_requests(limit=200, username=None):
             results = []
             for row in rows:
                 criteria_value_display, comp_type_display = _criteria_display(
-                    row[4],   # criteria_type
-                    row[7],   # criteria_value
-                    row[5],   # comp_type
-                    row[54],  # criteria_json
+                    row[4], row[7], row[5], row[54]
                 )
                 results.append({
                     "request_uuid":     row[0],
@@ -548,6 +616,8 @@ def fetch_all_requests(limit=200, username=None):
                     "comp_type":        row[5],
                     "channel":          row[6],
                     "criteria_value":   row[7],
+                    "criteria_value_display": criteria_value_display,
+                    "comp_type_display": comp_type_display,
                     "zip_file_path":    row[8],
                     "output_dir":       row[9],
                     "overall_status":   row[10],
@@ -583,79 +653,16 @@ def fetch_all_requests(limit=200, username=None):
                     "APPTNESS_MERGE_STATUS": row[49] or "",
                     "DOORDASH_EMAIL_FILEPATH": row[50] or "", "DOORDASH_MD5HASH_FILEPATH": row[51] or "",
                     "DOORDASH_EMAIL_MERGE_STATUS": row[52] or "", "DOORDASH_MD5HASH_MERGE_STATUS": row[53] or "",
-                    "criteria_value_display": criteria_value_display,
-                    "comp_type_display": comp_type_display,
+                    "criteria_json": row[54],
                     "responder_match": bool(row[55]),
                     "responder_days": row[56],
                     "merge_source_request_id": row[57],
-                    "merge_source_request_name": row[58] or ""
+                    "merge_source_request_name": row[58] or "",
                 })
             return results
     finally:
         conn.close()
 
-
-def _criteria_display(criteria_type, criteria_value, comp_type, criteria_json):
-    if criteria_type != "multi":
-        return criteria_value or "-", comp_type or "-"
-
-    try:
-        items = json.loads(criteria_json or "[]")
-    except (TypeError, ValueError):
-        return criteria_value or "-", comp_type or "-"
-
-    value_parts = []
-    comp_parts = []
-
-    labels = {
-        "age": "Age",
-        "state": "State",
-        "zips": "ZIP",
-    }
-    comp_labels = {
-        "greater": "Greater Than",
-        "less": "Lesser Than",
-        "between": "Between",
-        "include": "Include",
-        "exclude": "Exclude",
-    }
-
-    for item in items:
-        item_type = (item.get("type") or "").lower()
-        label = labels.get(item_type, item_type.title())
-        comparison = (item.get("comparison") or "").lower()
-
-        if item_type == "age":
-            if comparison == "between":
-                value = "{0} to {1}".format(
-                    item.get("from", ""),
-                    item.get("to", "")
-                )
-            else:
-                value = item.get("value", "")
-        elif item_type == "state":
-            value = ", ".join(item.get("values") or [])
-        elif item_type == "zips":
-            zip_path = item.get("file_path") or item.get("zip_file_path") or ""
-            value = Path(zip_path).name if zip_path else "Uploaded ZIP file"
-        else:
-            value = ""
-
-        if value:
-            value_parts.append("{0}: {1}".format(label, value))
-
-        if comparison:
-            comp_parts.append(
-                "{0}: {1}".format(
-                    label,
-                    comp_labels.get(comparison, comparison.title())
-                )
-            )
-
-    return (
-        " | ".join(value_parts) or criteria_value or "-",
-        " | ".join(comp_parts) or comp_type or "-",
-    )
 
 
 def fetch_dashboard_stats(username=None):
@@ -786,16 +793,11 @@ def build_command(payload, db_id, uploaded_zip=None):
     for ch in channels:
         cmd.extend(["--channel", ch])
 
-    if criteria == "multi":
-        cmd.extend(["--request-id", str(db_id)])
-    elif criteria in ("age", "state"):
-        cmd.extend(["--request-id", str(db_id)])
-        if criteria == "age":
-            cmd.extend(["--age", str(payload["criteria_value"])])
-        else:
-            cmd.extend(["--states"] + payload["criteria_value"].split(","))
-    else:  # zips
-        cmd.extend(["--request-id", str(db_id)])
+    # The processor reads the authoritative criteria JSON from the request
+    # row.  Keeping only the request ID here avoids parsing a Between age
+    # value such as "45,60" as a single integer in argparse.
+    cmd.extend(["--request-id", str(db_id)])
+    if uploaded_zip:
         cmd.extend(["--zip-file", str(uploaded_zip)])
 
     return cmd
@@ -1065,6 +1067,66 @@ def api_check_client_name():
     return jsonify({'available': not taken})
 
 
+@app.route('/api/check-merge-source')
+@login_required
+def api_check_merge_source():
+    """Validate a completed request selected as the merge source.
+
+    This is UI feedback only. ``submit_request`` repeats the same validation
+    before it creates a request, so a modified browser request cannot bypass it.
+    """
+    source_name = request.args.get('name', '').strip()
+    current_type = request.args.get('request_type', '').strip()
+
+    if not source_name:
+        return jsonify({
+            'available': False,
+            'message': 'Enter the completed previous request name.'
+        })
+    if current_type not in {'Suppression', 'Mailing', 'Doordash'}:
+        return jsonify({
+            'available': False,
+            'message': 'Select a valid request type first.'
+        })
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT request_type FROM requests "
+                "WHERE request_name=%s AND overall_status='completed'",
+                (source_name,),
+            )
+            previous = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not previous:
+        return jsonify({
+            'available': False,
+            'message': 'Previous Request Name must be a completed request.'
+        })
+
+    previous_type = previous[0]
+    if current_type == 'Doordash' and previous_type != 'Doordash':
+        return jsonify({
+            'available': False,
+            'message': 'DoorDash output can be merged only with a completed DoorDash request.'
+        })
+    if current_type != 'Doordash' and previous_type == 'Doordash':
+        return jsonify({
+            'available': False,
+            'message': 'Suppression/Mailing output cannot be merged with a DoorDash request.'
+        })
+
+    label = (
+        'Eligible completed DoorDash request.'
+        if current_type == 'Doordash'
+        else 'Eligible completed previous request.'
+    )
+    return jsonify({'available': True, 'message': label})
+
+
 
 @app.route('/api/requests')
 @login_required
@@ -1160,25 +1222,28 @@ def submit_request():
         criteria_type = 'zips'
         comp_type     = 'include'
         channel_list  = ['ALL']
+        # DoorDash owns its ZIP-only input.  Ignore any stale browser JSON
+        # so it cannot be routed into the non-DoorDash criteria processor.
+        criteria_items = []
     if criteria_items:
-        allowed_criteria = {'age', 'state', 'zips'}
+        allowed_criteria = {'age', 'state', 'zips', 'gender'}
         criteria_types = [item.get('type') for item in criteria_items]
-        if len(criteria_items) > 3 or len(set(criteria_types)) != len(criteria_types):
+        if len(criteria_items) > 4 or len(set(criteria_types)) != len(criteria_types):
             return jsonify({
                 'ok': False,
-                'error': 'Use each criterion only once: Age, State, and ZIP (maximum three).'
+                'error': 'Use each criterion only once: Age, State, ZIP, and Gender (maximum four).'
             }), 400
         invalid_criteria = [item for item in criteria_items if item.get('type') not in allowed_criteria]
         if invalid_criteria:
-            return jsonify({'ok': False, 'error': 'Criteria can use only Age, State, or ZIP.'}), 400
+            return jsonify({'ok': False, 'error': 'Criteria can use only Age, State, ZIP, or Gender.'}), 400
         if len(criteria_items) == 1:
             criteria_type = criteria_items[0].get('type', '')
             comp_type = criteria_items[0].get('comparison', '')
         else:
             criteria_type = 'multi'
             comp_type = 'include'
-    if criteria_type not in {'age', 'state', 'zips', 'multi'}:
-        return jsonify({'ok': False, 'error': 'Criteria type must be age, state, or zips.'}), 400
+    if criteria_type not in {'age', 'state', 'zips', 'gender', 'multi'}:
+        return jsonify({'ok': False, 'error': 'Criteria type must be age, state, ZIP, or gender.'}), 400
 
     if not client_name:
         return jsonify({'ok': False, 'error': 'Client Name is required.'}), 400
@@ -1190,8 +1255,8 @@ def submit_request():
 
     if criteria_type == 'age' and comp_type not in {'greater', 'less', 'between'}:
         return jsonify({'ok': False, 'error': 'Age criteria requires comp type greater or less.'}), 400
-    if criteria_type in {'state', 'zips'} and comp_type not in {'include', 'exclude'}:
-        return jsonify({'ok': False, 'error': 'State/Zips criteria requires include or exclude comp type.'}), 400
+    if criteria_type in {'state', 'zips', 'gender'} and comp_type not in {'include', 'exclude'}:
+        return jsonify({'ok': False, 'error': 'State, ZIP, and Gender criteria require Include or Exclude.'}), 400
 
     # Validate each channel
     valid_channels = {'ALL', 'GREEN', 'BLUE', 'ORANGE', 'ARCAMAX', 'APPTNESS'}
@@ -1216,9 +1281,10 @@ def submit_request():
                         return jsonify({'ok': False, 'error': 'Age value must be a number.'}), 400
                 else:
                     return jsonify({'ok': False, 'error': 'Age must be Greater Than, Lesser Than, or Between.'}), 400
-            elif item_type == 'state':
+            elif item_type in {'state', 'gender'}:
                 if item.get('comparison') not in {'include', 'exclude'} or not item.get('values'):
-                    return jsonify({'ok': False, 'error': 'State requires Include/Exclude and at least one state.'}), 400
+                    label = 'Gender' if item_type == 'gender' else 'State'
+                    return jsonify({'ok': False, 'error': label + ' requires Include/Exclude and at least one value.'}), 400
             elif item_type == 'zips' and item.get('comparison') not in {'include', 'exclude'}:
                 return jsonify({'ok': False, 'error': 'ZIP requires Include or Exclude.'}), 400
         if len(criteria_items) == 1:
@@ -1230,7 +1296,7 @@ def submit_request():
                     '{0},{1}'.format(item['from'], item['to'])
                     if comp_type == 'between' else str(item['value'])
                 )
-            elif criteria_type == 'state':
+            elif criteria_type in {'state', 'gender'}:
                 criteria_value = ','.join(item['values'])
             else:
                 criteria_value = None
@@ -1239,11 +1305,12 @@ def submit_request():
     elif criteria_type == 'age':
         if not criteria_value.isdigit():
             return jsonify({'ok': False, 'error': 'Valid age number is required.'}), 400
-    elif criteria_type == 'state':
-        states = [s.strip() for s in criteria_value.split(',') if s.strip()]
-        if not states:
-            return jsonify({'ok': False, 'error': 'At least one state code is required.'}), 400
-        criteria_value = ','.join(s.upper() for s in states)
+    elif criteria_type in {'state', 'gender'}:
+        values = [s.strip() for s in criteria_value.split(',') if s.strip()]
+        if not values:
+            label = 'Gender' if criteria_type == 'gender' else 'State'
+            return jsonify({'ok': False, 'error': 'At least one ' + label.lower() + ' value is required.'}), 400
+        criteria_value = ','.join(s.upper() for s in values)
     else:
         criteria_value = None
 

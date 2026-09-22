@@ -38,7 +38,7 @@
   <section class="filters-bar">
     <input type="text" id="searchInput" placeholder="🔍 Search name, type, criteria..." class="filter-input">
     <select id="typeFilter" class="filter-select"><option value="">All Types</option><option value="Suppression">Suppression</option><option value="Mailing">Mailing</option><option value="Doordash">Doordash</option></select>
-    <select id="criteriaFilter" class="filter-select"><option value="">All Criteria</option><option value="age">Age</option><option value="state">State</option><option value="zips">Zips</option></select>
+    <select id="criteriaFilter" class="filter-select"><option value="">All Criteria</option><option value="age">Age</option><option value="state">State</option><option value="zips">Zips</option><option value="gender">Gender</option></select>
     <select id="statusFilter" class="filter-select"><option value="">All Statuses</option><option value="completed">Completed</option><option value="failed">Failed</option><option value="inprogress">In Progress</option></select>
     <select id="channelFilter" class="filter-select"><option value="">All Channels</option><option value="GREEN">Green</option><option value="BLUE">Blue</option><option value="ORANGE">Orange</option><option value="ARCAMAX">Arcamax</option><option value="APPTNESS">Apptness</option><option value="ALL">All</option></select>
   </section>
@@ -59,44 +59,22 @@
             <td><span class="expand-indicator" aria-hidden="true">⌄</span><strong>{{ r.request_name }}</strong></td>
             <td>{{ r.client_name }}</td><td><span class="badge-type {{ r.request_type|lower }}">{{ r.request_type }}</span></td><td><span class="badge-criteria">{{ r.criteria_type|upper }}</span></td>
             {% set value = r.criteria_value_display or '-' %}
-            <td class="muted small">
-                {% if value|length > 20 %}
-                    <span class="value-truncated" title="{{ value }}">{{ value[:20] }}&hellip;</span>
-                {% else %}
-                    {{ value }}
-                {% endif %}
-            </td>
-            <td class="muted small">{{ r.comp_type_display or '-' }}</td>
-            <td><span class="tag">{{ r.channel }}</span></td>
+            <td class="muted small">{% if value|length > 20 %}<span class="value-truncated" title="{{ value }}">{{ value[:20] }}&hellip;</span>{% else %}{{ value }}{% endif %}</td><td class="muted small">{{ r.comp_type_display or '-' }}</td><td><span class="tag">{{ r.channel }}</span></td>
             <td><span class="badge {{ r.overall_status|lower|replace(' ', '') }}">{{ r.overall_status }}</span></td><td>{{ r.username }}</td><td class="muted small">{{ r.created_at }}</td><td class="muted small">{{ r.finished_at or '-' }}</td>
           </tr>
           <tr id="{{ row_id }}" class="request-details-row" hidden><td colspan="11">
             <div class="request-details-panel">
               <div class="request-details-title">{% if r.request_type == 'Doordash' %}Doordash files{% else %}Channel status{% endif %}<span>Hover or click a pill to view file details</span></div>
-            <div class="request-run-metadata">
-              <div class="request-run-metadata-item">
-                <span class="request-run-metadata-label">Responder Match:</span>
-                <span class="request-run-metadata-value">
-                  {% if r.responder_match %}
-                    Yes &mdash; {{ r.responder_days }} day{% if r.responder_days != 1 %}s{% endif %}
-                  {% else %}
-                    No
-                  {% endif %}
-                </span>
+              <div class="request-run-metadata">
+                <div class="request-run-metadata-item">
+                  <span class="request-run-metadata-label">Responder Match:</span>
+                  <span class="request-run-metadata-value">{% if r.responder_match %}Yes &mdash; {{ r.responder_days }} day{% if r.responder_days != 1 %}s{% endif %}{% else %}No{% endif %}</span>
+                </div>
+                <div class="request-run-metadata-item">
+                  <span class="request-run-metadata-label">Merged Previous Output:</span>
+                  <span class="request-run-metadata-value">{% if r.merge_source_request_id %}Yes &mdash; {{ r.merge_source_request_name or 'Previous request' }} (ID: {{ r.merge_source_request_id }}){% else %}No{% endif %}</span>
+                </div>
               </div>
-
-              <div class="request-run-metadata-item">
-                <span class="request-run-metadata-label">Merged Previous Output:</span>
-                <span class="request-run-metadata-value">
-                  {% if r.merge_source_request_id %}
-                    Yes &mdash; {{ r.merge_source_request_name or 'Previous request' }}
-                    (ID: {{ r.merge_source_request_id }})
-                  {% else %}
-                    No
-                  {% endif %}
-                </span>
-             </div>
-           </div>
               <div class="channel-status-list">
               {% if r.request_type == 'Doordash' %}
                 {% set email_ready = r.DOORDASH_EMAIL_FTP or r.DOORDASH_EMAIL_FILECOUNT %}

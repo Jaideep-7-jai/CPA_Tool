@@ -50,6 +50,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const addCriteriaBtn = document.getElementById('addCriteriaBtn');
   const mergeEnabledEl = document.getElementById('merge_enabled');
   const mergeRequestFields = document.getElementById('mergeRequestFields');
+  const mergeSourceNameEl = document.getElementById('merge_source_request_name');
+  const mergeSourceStatusEl = document.getElementById('mergeSourceStatus');
+  const mergeSourceHintEl = document.getElementById('mergeSourceHint');
   const responderMatchEl = document.getElementById('responder_match');
   const responderDaysFields = document.getElementById('responderDaysFields');
   const responderDaysEl = document.getElementById('responder_days');
@@ -61,9 +64,77 @@ document.addEventListener('DOMContentLoaded', () => {
     responderDaysValueEl.textContent = `${responderDaysEl.value} day${responderDaysEl.value === '1' ? '' : 's'}`;
   }
 
+  // ── Merge source eligibility check ───────────────────────────────────────
+  // The submit API performs this same check authoritatively. This check makes
+  // the result visible beside the Previous Request Name field.
+  let mergeSourceCheckTimer = null;
+  let mergeSourceIsValid = false;
+  const mergeSourceDefaultHint =
+    'Matching channel files are merged; the previous request remains unchanged.';
+
+  function resetMergeSourceStatus() {
+    mergeSourceIsValid = false;
+    mergeSourceStatusEl.textContent = '';
+    mergeSourceStatusEl.className = 'name-status';
+    mergeSourceNameEl.classList.remove('error-input');
+    mergeSourceHintEl.textContent = mergeSourceDefaultHint;
+  }
+
+  function checkMergeSource() {
+    const sourceName = mergeSourceNameEl.value.trim();
+    const currentType = requestTypeEl.value;
+    if (!mergeEnabledEl.checked || !sourceName) {
+      resetMergeSourceStatus();
+      return;
+    }
+
+    mergeSourceIsValid = false;
+    mergeSourceStatusEl.textContent = 'Checking…';
+    mergeSourceStatusEl.className = 'name-status checking';
+    mergeSourceNameEl.classList.remove('error-input');
+
+    const params = new URLSearchParams({
+      name: sourceName,
+      request_type: currentType,
+    });
+    fetch(`/api/check-merge-source?${params.toString()}`)
+      .then(response => response.json())
+      .then(data => {
+        mergeSourceHintEl.textContent = data.message || mergeSourceDefaultHint;
+        if (data.available) {
+          mergeSourceStatusEl.textContent = '✅ Eligible';
+          mergeSourceStatusEl.className = 'name-status available';
+          mergeSourceNameEl.classList.remove('error-input');
+          mergeSourceIsValid = true;
+        } else {
+          mergeSourceStatusEl.textContent = '✖ Not eligible';
+          mergeSourceStatusEl.className = 'name-status taken';
+          mergeSourceNameEl.classList.add('error-input');
+          mergeSourceIsValid = false;
+        }
+      })
+      .catch(() => {
+        mergeSourceStatusEl.textContent = '⚠ Check failed';
+        mergeSourceStatusEl.className = 'name-status error';
+        mergeSourceNameEl.classList.add('error-input');
+        mergeSourceHintEl.textContent = 'Unable to validate the previous request. Try again.';
+        mergeSourceIsValid = false;
+      });
+  }
+
+  function scheduleMergeSourceCheck() {
+    clearTimeout(mergeSourceCheckTimer);
+    mergeSourceIsValid = false;
+    mergeSourceCheckTimer = setTimeout(checkMergeSource, 400);
+  }
+
+  const supportedCriteria = ['age', 'state', 'zips', 'gender'];
+
   function criterionOptions(selected) {
-    return ['age', 'state', 'zips'].map(type => {
-      const label = type === 'age' ? 'Age' : type === 'state' ? 'State' : 'ZIP';
+    return supportedCriteria.map(type => {
+      const label = type === 'age' ? 'Age'
+        : type === 'state' ? 'State'
+          : type === 'zips' ? 'ZIP' : 'Gender';
       return `<option value="${type}" ${type === selected ? 'selected' : ''}>${label}</option>`;
     }).join('');
   }
@@ -78,7 +149,7 @@ document.addEventListener('DOMContentLoaded', () => {
         item.to = row.querySelector('.age-to').value.trim();
       } else if (type === 'age') {
         item.value = row.querySelector('.criteria-value').value.trim();
-      } else if (type === 'state') {
+      } else if (type === 'state' || type === 'gender') {
         item.values = row.querySelector('.criteria-value').value
           .split(',').map(value => value.trim()).filter(Boolean);
       }
@@ -97,9 +168,10 @@ document.addEventListener('DOMContentLoaded', () => {
         <option value="less">Lesser Than</option>
         <option value="between">Between</option>`;
       valueWrap.innerHTML = '<input class="criteria-value" type="number" min="0" placeholder="Age">';
-    } else if (type === 'state') {
+    } else if (type === 'state' || type === 'gender') {
       comparison.innerHTML = '<option value="include">Include</option><option value="exclude">Exclude</option>';
-      valueWrap.innerHTML = '<input class="criteria-value" type="text" placeholder="CA, TX, NY">';
+      const placeholder = type === 'gender' ? 'M, F' : 'CA, TX, NY';
+      valueWrap.innerHTML = `<input class="criteria-value" type="text" placeholder="${placeholder}">`;
     } else {
       comparison.innerHTML = '<option value="include">Include</option><option value="exclude">Exclude</option>';
       valueWrap.innerHTML = '<input type="file" name="zip_file" class="criteria-zip-file" accept=".csv,.txt"><span class="criteria-file-name">Upload ZIP file</span>';
@@ -108,9 +180,9 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function addCriterion(type = null) {
-    if (criteriaRows.length >= 3) return;
+    if (criteriaRows.length >= supportedCriteria.length) return;
     const selectedTypes = criteriaRows.map(row => row.querySelector('.criteria-kind').value);
-    const criterionType = type || ['age', 'state', 'zips'].find(
+    const criterionType = type || supportedCriteria.find(
       candidate => !selectedTypes.includes(candidate)
     );
     if (!criterionType || selectedTypes.includes(criterionType)) return;
@@ -129,14 +201,10 @@ document.addEventListener('DOMContentLoaded', () => {
       updateCriteriaControls();
     });
     row.querySelector('.criteria-comparison').addEventListener('change', () => {
-      const type = row.querySelector('.criteria-kind').value;
-      const comparison = row.querySelector('.criteria-comparison').value;
-      const valueWrap = row.querySelector('.criteria-row-value');
-
-      if (type === 'age') {
-        valueWrap.innerHTML = comparison === 'between'
-          ? '<input class="age-from" type="number" min="0" placeholder="From age"><input class="age-to" type="number" min="0" placeholder="To age">'
-          : '<input class="criteria-value" type="number" min="0" placeholder="Age">';
+      if (row.querySelector('.criteria-kind').value === 'age' && row.querySelector('.criteria-comparison').value === 'between') {
+        row.querySelector('.criteria-row-value').innerHTML = '<input class="age-from" type="number" min="0" placeholder="From age"><input class="age-to" type="number" min="0" placeholder="To age">';
+      } else {
+        renderCriterionValue(row);
       }
       syncCriteriaJson();
     });
@@ -161,8 +229,8 @@ document.addEventListener('DOMContentLoaded', () => {
   function updateCriteriaControls() {
     if (!addCriteriaBtn) return;
     const selectedTypes = criteriaRows.map(row => row.querySelector('.criteria-kind').value);
-    addCriteriaBtn.disabled = criteriaRows.length >= 3;
-    addCriteriaBtn.classList.toggle('hidden', criteriaRows.length >= 3);
+    addCriteriaBtn.disabled = criteriaRows.length >= supportedCriteria.length;
+    addCriteriaBtn.classList.toggle('hidden', criteriaRows.length >= supportedCriteria.length);
     criteriaRows.forEach(row => {
       const select = row.querySelector('.criteria-kind');
       Array.from(select.options).forEach(option => {
@@ -182,8 +250,14 @@ document.addEventListener('DOMContentLoaded', () => {
     mergeEnabledEl.addEventListener('change', () => {
       const enabled = mergeEnabledEl.checked;
       mergeRequestFields.classList.toggle('hidden', !enabled);
-      if (!enabled) document.getElementById('merge_source_request_name').value = '';
+      if (!enabled) {
+        mergeSourceNameEl.value = '';
+        resetMergeSourceStatus();
+      } else {
+        scheduleMergeSourceCheck();
+      }
     });
+    mergeSourceNameEl.addEventListener('input', scheduleMergeSourceCheck);
     responderMatchEl.addEventListener('change', () => {
       const enabled = responderMatchEl.checked;
       responderDaysFields.classList.toggle('hidden', !enabled);
@@ -295,6 +369,7 @@ document.addEventListener('DOMContentLoaded', () => {
     scheduleClientNameCheck();
     updateChannelChoices();
     updateCriteriaFields();
+    if (mergeEnabledEl.checked) scheduleMergeSourceCheck();
   }
 
   // ── Show/hide criteria value + file upload ──────────────────────────────────
@@ -487,6 +562,12 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
+      if (mergeEnabledEl.checked && !mergeSourceIsValid) {
+        formMessage.textContent = '⚠ Enter an eligible completed previous request before merging.';
+        formMessage.className   = 'message error';
+        return;
+      }
+
       const selectedChannels = getSelectedChannels();
       if (selectedChannels.length === 0) {
         formMessage.textContent = '⚠ Please select at least one channel.';
@@ -524,6 +605,7 @@ document.addEventListener('DOMContentLoaded', () => {
         form.reset();
         resetCriteriaBuilder();
         mergeRequestFields.classList.add('hidden');
+        resetMergeSourceStatus();
         responderDaysFields.classList.add('hidden');
         responderDaysEl.value = '30';
         syncResponderDaysValue();

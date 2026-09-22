@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-ZIPS Processing - unique request-driven channel execution.
-Mirrors AGE_STATE/age_state.py exactly in structure, logging, and flow.
+Consolidated criteria processor for Suppression and Mailing requests.
+
+This module owns the complete non-DoorDash processing path for Age, State,
+ZIP, Gender, and any supported combination of those criteria. It replaces
+the old AGE_STATE, ZIPS, and MULTI_CRITERIA runtime routes. DoorDash imports
+the shared low-level helpers it needs from here, but retains its own workflow.
 
 Key differences from age_state:
   - ZIP codes are provided via UI upload (file attachment)
@@ -51,6 +55,8 @@ Processing flow
     - DROP the shared ZIP staging table (only after ALL channels finish)
 """
 
+import csv
+import json
 import os
 import re
 import time
@@ -61,7 +67,7 @@ import subprocess
 import shlex
 import pandas as pd
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import SNOWSQL_PASSPHRASE, AWS_KEY_ID, AWS_SECRET_KEY, S3_BASE
@@ -74,17 +80,18 @@ from utils import (
 from MERGE_OUTPUT.merge_output import merge_current_file
 
 DB_CONFIG = {
-    "host": "zds-prod-jbdb3-vip.bo3.e-dialog.com",
-    "user": "techuser",
-    "password": "tech12#$",
-    "database": "CUST_TECH_DB",
-    "charset": "utf8mb4",
+    # Service-provided values; do not put operational credentials in Git.
+    "host":      os.getenv("CPA_DB_HOST", ""),
+    "user":      os.getenv("CPA_DB_USER", ""),
+    "password":  os.getenv("CPA_DB_PASSWORD", ""),
+    "database":  os.getenv("CPA_DB_NAME", "CUST_TECH_DB"),
+    "charset":   "utf8mb4",
     "autocommit": True,
 }
 
-FTP_USERNAME = "GreenPub"
-FTP_PASSWORD = "Zet@Welcome1!"
-FTP_HOST = "zxds-ftp-02.bo3.e-dialog.com"
+FTP_USERNAME = os.getenv("CPA_FTP_USERNAME", "")
+FTP_PASSWORD = os.getenv("CPA_FTP_PASSWORD", "")
+FTP_HOST = os.getenv("CPA_FTP_HOST", "")
 
 CHANNELS = ["GREEN", "BLUE", "ARCAMAX", "ORANGE"]
 
@@ -107,6 +114,34 @@ def _step(log, step_num, total_steps, description, channel_name=""):
     log.info(
         f"{prefix}{'─' * 4} STEP {step_num}/{total_steps} {'─' * 4}  {description}"
     )
+
+
+def _trace(log, event, **values):
+    """Write a safe, one-line diagnostic record for validation/debugging."""
+    details = " | ".join(
+        f"{key}={value}" for key, value in values.items()
+    )
+    log.info("  TRACE | %s%s", event, f" | {details}" if details else "")
+
+
+def _safe_sql_for_log(sql):
+    """Keep SQL debugging useful without putting AWS credentials in logs."""
+    sql = re.sub(r"AWS_KEY_ID='[^']*'", "AWS_KEY_ID='***'", sql)
+    return re.sub(r"AWS_SECRET_KEY='[^']*'", "AWS_SECRET_KEY='***'", sql)
+
+
+def _verify_local_file(log, label, file_path, require_content=True):
+    """Validate an expected local artifact and log its exact state."""
+    path = Path(file_path)
+    exists = path.is_file()
+    size = path.stat().st_size if exists else -1
+    _trace(log, "file validation", label=label, path=path,
+           exists=exists, size_bytes=size)
+    if not exists:
+        raise RuntimeError(f"Required {label} was not created: {path}")
+    if require_content and size <= 0:
+        raise RuntimeError(f"Required {label} is empty: {path}")
+    return size
 
 
 # ---------------------------------------------------------------------------
@@ -152,11 +187,43 @@ def setup_channel_logging(run_dir: Path, channel_name: str) -> logging.Logger:
     return lg
 
 
+def setup_processor_main_logging(run_dir: Path) -> logging.Logger:
+    """Create the main log for the consolidated non-DoorDash workflow."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = run_dir / "logs" / "request_processor_{0}.log".format(ts)
+    log = logging.getLogger("request_processor_main")
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    log.handlers.clear()
+    log.addHandler(_file_handler(log_file))
+    return log
+
+
+def setup_processor_channel_logging(run_dir: Path, channel_name: str) -> logging.Logger:
+    """Create a per-channel log for the consolidated non-DoorDash workflow."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = str(channel_name).upper()
+    log_file = run_dir / "logs" / "{0}_request_processor_{1}.log".format(name, ts)
+    log = logging.getLogger("request_processor_{0}".format(name))
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    log.handlers.clear()
+    log.addHandler(_file_handler(log_file))
+    return log
+
+
 # ---------------------------------------------------------------------------
 # DB helpers  (mirrors age_state exactly)
 # ---------------------------------------------------------------------------
 
 def get_db_with_retry(log=None):
+    missing = [key for key in ("host", "user", "password") if not DB_CONFIG[key]]
+    if missing:
+        raise RuntimeError(
+            "Missing database configuration: set "
+            + ", ".join("CPA_DB_" + key.upper() for key in missing)
+            + "."
+        )
     last_exc = None
     for attempt in range(_DB_RETRY_ATTEMPTS):
         try:
@@ -389,6 +456,8 @@ def _build_common_context(request_id, channel_name, run_dir: Path):
 def _query_snowflake(query_sql, log):
     """Run a snowsql query and return the first integer found in output, else -1."""
     try:
+        _trace(log, "Snowflake validation query starting",
+               query=_safe_sql_for_log(query_sql))
         os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
         output = subprocess.check_output(
             ["snowsql", "-c", "datateam1", "-q", query_sql,
@@ -400,7 +469,9 @@ def _query_snowflake(query_sql, log):
             stderr=subprocess.STDOUT,
         )
         match = re.search(r"(\d+)", output)
-        return int(match.group(1)) if match else -1
+        count = int(match.group(1)) if match else -1
+        _trace(log, "Snowflake validation query finished", count=count)
+        return count
     except Exception as exc:
         log.warning(f"_query_snowflake failed (non-fatal): {exc}")
         return -1
@@ -445,7 +516,9 @@ def _load_zips_from_s3(zip_staging_table: str, s3_zip_path: str, log) -> int:
         f"ON_ERROR='CONTINUE' PURGE=FALSE;"
     )
     log.info(f"  Loading ZIP codes from S3: {s3_zip_path}")
-    log.info(f"  COPY SQL: {copy_sql}")
+    log.info(f"  COPY SQL: {_safe_sql_for_log(copy_sql)}")
+    _trace(log, "ZIP staging load parameters", staging_table=zip_staging_table,
+           s3_file=s3_zip_path, file_format="CSV comma-delimited, skip header=1")
     run_command(["snowsql", "-c", "datateam1", "-q", copy_sql])
 
     count_sql    = f"SELECT COUNT(*) FROM {zip_staging_table};"
@@ -473,32 +546,30 @@ def _drop_zip_staging_table(zip_staging_table: str, log) -> None:
 
 def _responder_join(channel_name, responder_match, responder_days):
     """Return the optional, deduplicated responder join for one channel."""
+    channel_name = str(channel_name).upper()
     if not responder_match or channel_name not in ("GREEN", "BLUE", "ORANGE"):
         return ""
-
     days = int(responder_days or 0)
     if days < 1:
-        raise ValueError(
-            "Responder Match requires responder_days to be at least 1."
-        )
-
+        raise ValueError("Responder Match requires responder_days to be at least 1.")
     if channel_name in ("GREEN", "BLUE"):
         responder_channel = "GREEN" if channel_name == "GREEN" else "ORANGE"
-
         return (
             "JOIN (SELECT DISTINCT LOWER(TRIM(emailid)) AS email "
             "FROM GREEN.GREEN_LPT.RAW_OPENS_FOLLOWUP "
-            "WHERE CHANNELNAME = '{0}' "
+            "WHERE CHANNELNAME='{0}' "
             "AND opendate >= DATEADD(day, -{1}, CURRENT_DATE())) responders "
-            "ON LOWER(TRIM(a.email)) = responders.email "
-        ).format(responder_channel, days)
-
+            "ON LOWER(TRIM(a.email)) = responders.email ".format(
+                responder_channel, days
+            )
+        )
     return (
         "JOIN (SELECT DISTINCT LOWER(TRIM(email)) AS email "
         "FROM GREEN.DT_DATA.APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND "
         "WHERE OPEN_DATE >= DATEADD(day, -{0}, CURRENT_DATE())) responders "
         "ON LOWER(TRIM(a.email_address)) = responders.email ".format(days)
     )
+
 
 def _insert_into_perm_table(
     perm_table, channel_name, zip_staging_table, comp_type, responder_match,
@@ -516,6 +587,15 @@ def _insert_into_perm_table(
     responder_join = _responder_join(channel_name, responder_match, responder_days)
 
     kw = "IN" if comp_type == "include" else "NOT IN"
+    _trace(
+        log, "Snowflake ZIP load parameters", channel=channel_name,
+        comparison=comp_type, sql_operator=kw,
+        staging_table=zip_staging_table,
+        responder_match=bool(responder_match),
+        responder_days=responder_days if responder_match else "not enabled",
+        responder_join_enabled=bool(responder_join),
+        target_table=perm_table,
+    )
 
     if channel_name in ("GREEN", "BLUE"):
         profile_table = (
@@ -573,6 +653,8 @@ def _insert_into_perm_table(
     log.info(f"  Target table     : {perm_table}")
     log.info(f"  ZIP staging table: {zip_staging_table}")
     log.info(f"  comp_type        : {comp_type}  ({kw})")
+    _trace(log, "Snowflake ZIP condition resolved", channel=channel_name,
+           condition=condition)
     log.info(f"  INSERT SQL       : {insert_sql}")
     log.info("  Executing CREATE + INSERT via snowsql ...")
 
@@ -621,6 +703,9 @@ def _export_complete_final_file(export_type, perm_table, export_path, channel_na
         f"MAX_FILE_SIZE=490000000;"
     )
 
+    _trace(log, "S3 export parameters", export_type=export_type,
+           channel=channel_name, source_table=perm_table,
+           s3_prefix=export_path, select_clause=select_clause)
     log.info(f"  Source table : {perm_table}")
     log.info(f"  S3 target    : {export_path}/")
     log.info(f"  SELECT clause: {select_clause}")
@@ -696,6 +781,9 @@ def _download_and_combine(s3_path, download_dir, work_dir,
         f"  Downloaded {len(downloaded)} part file(s): "
         f"{[p.name for p in downloaded]}"
     )
+    for part in downloaded:
+        _trace(log, "downloaded S3 part", part=part.name,
+               size_bytes=part.stat().st_size)
 
     out_path = work_dir / output_file
 
@@ -719,7 +807,10 @@ def _download_and_combine(s3_path, download_dir, work_dir,
         except Exception:
             pass
 
+    _verify_local_file(log, "combined download", out_path)
     combined_count = _count_file_lines(str(out_path))
+    _trace(log, "combined download validation", output=out_path,
+           line_count=combined_count, channel=channel_name)
     log.info(f"  Combined file written: {out_path}  |  rows: {combined_count:,}")
     return combined_count
 
@@ -728,13 +819,18 @@ def _download_and_combine(s3_path, download_dir, work_dir,
 
 def _post_to_ftp(final_files_dir, path_date, output_file, log):
     """FTP upload from FINAL_FILES/ and return the remote FTP path."""
+    if not all((FTP_USERNAME, FTP_PASSWORD, FTP_HOST)):
+        raise RuntimeError(
+            "Missing FTP configuration: set CPA_FTP_USERNAME, "
+            "CPA_FTP_PASSWORD, and CPA_FTP_HOST."
+        )
     ftp_dest = f"/CPA/{path_date}/{output_file}"
     ftp_cmd = (
         f'lftp -u "{FTP_USERNAME},{FTP_PASSWORD}" ftp://{FTP_HOST} '
         f'-e "mkdir -p /CPA/{path_date};cd /CPA/{path_date};put {output_file};bye"'
     )
     local_path = Path(final_files_dir) / output_file
-    local_size = local_path.stat().st_size if local_path.exists() else -1
+    local_size = _verify_local_file(log, "FTP upload file", local_path)
 
     log.info(f"  FTP destination : {ftp_dest}")
     log.info(f"  Local file size : {local_size:,} bytes  ({local_path})")
@@ -742,6 +838,8 @@ def _post_to_ftp(final_files_dir, path_date, output_file, log):
 
     run_command(ftp_cmd, cwd=str(final_files_dir))
     log.info(f"  FTP upload completed successfully -> {ftp_dest}")
+    _trace(log, "FTP command completed", destination=ftp_dest,
+           local_file=local_path.name, size_bytes=local_size)
 
     # Return the full FTP path so callers can persist it to the DB
     return ftp_dest
@@ -791,6 +889,16 @@ def process_green_blue_zip(request_id, channel_name, zip_staging_table, run_dir:
     update_request_status(request_id, "Started", channel_status, log)
 
     ctx = _build_common_context(request_id, channel_name, run_dir)
+    _trace(
+        log, "channel input validation", request_id=request_id,
+        channel=channel_name, request_type=ctx["request_type"],
+        comparison=ctx["comp_type"], target_table=ctx["perm_table"],
+        staging_table=zip_staging_table,
+        responder_match=bool(ctx["request_data"].get("responder_match")),
+        responder_days=(ctx["request_data"].get("responder_days")
+                        if ctx["request_data"].get("responder_match") else "not enabled"),
+        merge_source_request_id=(ctx["request_data"].get("merge_source_request_id") or "NULL"),
+    )
     log.info(
         f"  comp_type      = {ctx['comp_type']}\n"
         f"  perm_table     = {ctx['perm_table']}\n"
@@ -861,16 +969,30 @@ def process_green_blue_zip(request_id, channel_name, zip_staging_table, run_dir:
         _step(log, 6, TOTAL_STEPS, "Moving combined file to FINAL_FILES/", channel_name)
         src_file  = channel_tmp / ctx["output_file"]
         dest_file = final_files_dir / ctx["output_file"]
+        _verify_local_file(log, "combined channel file before move", src_file)
         shutil.move(str(src_file), str(dest_file))
+        _verify_local_file(log, "final channel file after move", dest_file)
         record_count = _count_file_lines(str(dest_file))
+        _trace(log, "channel storage update", channel=channel_name,
+               s3_path=path_FINAL, row_count=record_count)
         update_channel_storage(request_id, channel_name, path_FINAL, record_count, log)
         merge_mode = ""
         if ctx["request_data"].get("merge_source_request_id"):
+            _trace(log, "merge enabled", current_request_id=request_id,
+                   source_request_id=ctx["request_data"]["merge_source_request_id"],
+                   channel=channel_name)
             merge_result = merge_current_file(
                 request_id, ctx["request_data"]["merge_source_request_id"], channel_name,
                 dest_file, path_FINAL, channel_tmp, log
             )
             record_count, merge_mode = merge_result["count"], merge_result["merge_mode"]
+            _verify_local_file(log, "merged channel file", dest_file)
+            _trace(log, "merge completed", channel=channel_name,
+                   merge_mode=merge_mode, merged_row_count=record_count,
+                   merged_s3_path=merge_result.get("s3_path", ""))
+        else:
+            _trace(log, "merge skipped", channel=channel_name,
+                   reason="merge_source_request_id is NULL")
         log.info(f"  STEP 6 DONE: Moved {src_file.name} -> FINAL_FILES/  |  rows: {record_count:,}")
 
         # ── STEP 7/7 ──────────────────────────────────────────────────────
@@ -925,6 +1047,16 @@ def process_arcamax_zip(request_id, zip_staging_table, run_dir: Path):
     update_request_status(request_id, "Started", channel_status, log)
 
     ctx = _build_common_context(request_id, channel_name, run_dir)
+    _trace(
+        log, "channel input validation", request_id=request_id,
+        channel=channel_name, request_type=ctx["request_type"],
+        comparison=ctx["comp_type"], target_table=ctx["perm_table"],
+        staging_table=zip_staging_table,
+        responder_match=bool(ctx["request_data"].get("responder_match")),
+        responder_days=(ctx["request_data"].get("responder_days")
+                        if ctx["request_data"].get("responder_match") else "not enabled"),
+        merge_source_request_id=(ctx["request_data"].get("merge_source_request_id") or "NULL"),
+    )
     log.info(
         f"  comp_type     = {ctx['comp_type']}\n"
         f"  perm_table    = {ctx['perm_table']}\n"
@@ -992,16 +1124,30 @@ def process_arcamax_zip(request_id, zip_staging_table, run_dir: Path):
         _step(log, 6, TOTAL_STEPS, "Moving combined file to FINAL_FILES/", channel_name)
         src_file  = channel_tmp / ctx["output_file"]
         dest_file = final_files_dir / ctx["output_file"]
+        _verify_local_file(log, "combined channel file before move", src_file)
         shutil.move(str(src_file), str(dest_file))
+        _verify_local_file(log, "final channel file after move", dest_file)
         record_count = _count_file_lines(str(dest_file))
+        _trace(log, "channel storage update", channel=channel_name,
+               s3_path=path_FINAL, row_count=record_count)
         update_channel_storage(request_id, channel_name, path_FINAL, record_count, log)
         merge_mode = ""
         if ctx["request_data"].get("merge_source_request_id"):
+            _trace(log, "merge enabled", current_request_id=request_id,
+                   source_request_id=ctx["request_data"]["merge_source_request_id"],
+                   channel=channel_name)
             merge_result = merge_current_file(
                 request_id, ctx["request_data"]["merge_source_request_id"], channel_name,
                 dest_file, path_FINAL, channel_tmp, log
             )
             record_count, merge_mode = merge_result["count"], merge_result["merge_mode"]
+            _verify_local_file(log, "merged channel file", dest_file)
+            _trace(log, "merge completed", channel=channel_name,
+                   merge_mode=merge_mode, merged_row_count=record_count,
+                   merged_s3_path=merge_result.get("s3_path", ""))
+        else:
+            _trace(log, "merge skipped", channel=channel_name,
+                   reason="merge_source_request_id is NULL")
         log.info(f"  STEP 6 DONE: Moved {src_file.name} -> FINAL_FILES/  |  rows: {record_count:,}")
 
         # ── STEP 7/7 ──────────────────────────────────────────────────────
@@ -1057,6 +1203,16 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
     update_request_status(request_id, "Started", channel_status, log)
 
     ctx = _build_common_context(request_id, channel_name, run_dir)
+    _trace(
+        log, "channel input validation", request_id=request_id,
+        channel=channel_name, request_type=ctx["request_type"],
+        comparison=ctx["comp_type"], target_table=ctx["perm_table"],
+        staging_table=zip_staging_table,
+        responder_match=bool(ctx["request_data"].get("responder_match")),
+        responder_days=(ctx["request_data"].get("responder_days")
+                        if ctx["request_data"].get("responder_match") else "not enabled"),
+        merge_source_request_id=(ctx["request_data"].get("merge_source_request_id") or "NULL"),
+    )
     log.info(
         f"  comp_type     = {ctx['comp_type']}\n"
         f"  perm_table    = {ctx['perm_table']}\n"
@@ -1119,63 +1275,103 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
             ctx["output_file"], channel_name, log
         )
         combined_path = channel_tmp / ctx["output_file"]
+        _verify_local_file(log, "ORANGE combined raw file", combined_path)
+        _trace(log, "channel storage update", channel=channel_name,
+               s3_path=path_FINAL, row_count=combined_count)
         update_channel_storage(request_id, channel_name, path_FINAL, combined_count, log)
         merge_mode = ""
         if ctx["request_data"].get("merge_source_request_id"):
+            _trace(log, "merge enabled", current_request_id=request_id,
+                   source_request_id=ctx["request_data"]["merge_source_request_id"],
+                   channel=channel_name)
             merge_result = merge_current_file(
                 request_id, ctx["request_data"]["merge_source_request_id"], channel_name,
                 combined_path, path_FINAL, channel_tmp, log
             )
             combined_count, merge_mode = merge_result["count"], merge_result["merge_mode"]
+            _verify_local_file(log, "merged ORANGE raw file", combined_path)
+            _trace(log, "merge completed", channel=channel_name,
+                   merge_mode=merge_mode, merged_row_count=combined_count,
+                   merged_s3_path=merge_result.get("s3_path", ""))
+        else:
+            _trace(log, "merge skipped", channel=channel_name,
+                   reason="merge_source_request_id is NULL")
         log.info(f"  STEP 5 DONE: Combined file rows: {combined_count:,}")
 
-        # ── STEP 6/7 ── Split per-ESP + ZIP archive ────────────────────────
-        _step(log, 6, TOTAL_STEPS, "Splitting ORANGE file per-ESP + creating ZIP archive", channel_name)
-        # combined CSV was written by _download_and_combine into channel_tmp/output_file
+        # ── STEP 6/7 ── Build the format requested by the CURRENT request ─
+        request_type = str(ctx["request_type"]).lower()
         df_final = pd.read_csv(
             str(combined_path), sep="|", header=0,
             names=["email", "account_name"], dtype=str,
-        )
-        esp_names   = df_final["account_name"].drop_duplicates().sort_values().tolist()
-        total_count = len(df_final)
-        log.info(f"  Total ORANGE records: {total_count:,} across {len(esp_names)} ESPs")
+        ).fillna("")
+        _trace(log, "ORANGE data validation", raw_file=combined_path,
+               dataframe_rows=len(df_final),
+               expected_columns="email,account_name",
+               actual_columns="|".join(str(column) for column in df_final.columns),
+               empty_email_rows=int((df_final["email"].str.strip() == "").sum()))
 
-        output_path = channel_tmp / "ORANGE_OP_PATH"
-        output_path.mkdir(exist_ok=True)
+        legacy_doordash_output = request_type == "doordash"
+        if request_type == "suppression":
+            _step(log, 6, TOTAL_STEPS, "Creating ORANGE suppression email list", channel_name)
+            output_file = ctx["output_file"]
+            final_file_path = final_files_dir / output_file
+            email_rows = df_final[["email"]].drop_duplicates()
+            email_rows.to_csv(str(final_file_path), index=False, header=False)
+            _verify_local_file(log, "ORANGE suppression CSV", final_file_path)
+            record_count = len(email_rows)
+            log.info(
+                f"  STEP 6 DONE: Suppression CSV created -> {final_file_path} "
+                f"| unique emails: {record_count:,}"
+            )
 
-        for esp in esp_names:
-            df_esp = df_final[df_final["account_name"] == esp][["email"]]
-            df_esp.to_csv(output_path / f"{esp}_ORANGE_DATA.csv", index=False, header=False)
-            log.info(f"  ESP {esp}: {len(df_esp):,} records")
+        else:
+            _step(log, 6, TOTAL_STEPS, "Splitting ORANGE file per-ESP + creating ZIP archive", channel_name)
+            output_path = channel_tmp / "ORANGE_OP_PATH"
+            output_path.mkdir(exist_ok=True)
+            esp_names = df_final["account_name"].drop_duplicates().sort_values().tolist()
+            record_count = 0
+            log.info(f"  Total ORANGE records: {len(df_final):,} across {len(esp_names)} ESPs")
 
-        zip_out_name = ctx["output_file"].replace(".csv", ".zip")
-        zip_out      = final_files_dir / zip_out_name
-        run_command(
-            ["zip", "-r", str(zip_out), output_path.name],
-            cwd=str(channel_tmp)
-        )
-        log.info(f"  STEP 6 DONE: ESP ZIP archive created -> {zip_out}")
+            for esp in esp_names:
+                df_esp = df_final[df_final["account_name"] == esp][["email"]].drop_duplicates()
+                esp_file = output_path / f"{esp}_ORANGE_DATA.csv"
+                df_esp.to_csv(esp_file, index=False, header=False)
+                _verify_local_file(log, f"ORANGE ESP file ({esp})", esp_file)
+                record_count += len(df_esp)
+                log.info(f"  ESP {esp}: {len(df_esp):,} records")
 
-        # Also copy the combined CSV (email-only suppression file) to FINAL_FILES/
-        supp_dest = final_files_dir / ctx["output_file"]
-        shutil.copy(str(combined_path), str(supp_dest))
-        log.info(f"  Suppression CSV copied -> FINAL_FILES/{ctx['output_file']}")
+            output_file = ctx["output_file"].replace(".csv", ".zip")
+            final_file_path = final_files_dir / output_file
+            if not esp_names:
+                raise RuntimeError(
+                    "ORANGE mailing output has no non-empty ESP groups; "
+                    "a ZIP archive cannot be created."
+                )
+            _trace(log, "ORANGE mailing archive validation",
+                   esp_file_count=len(esp_names), zip_path=final_file_path)
+            run_command(
+                ["zip", "-r", str(final_file_path), output_path.name],
+                cwd=str(channel_tmp)
+            )
+            _verify_local_file(log, "ORANGE mailing ZIP", final_file_path)
+            log.info(f"  STEP 6 DONE: Mailing ESP ZIP created -> {final_file_path}")
+            if legacy_doordash_output:
+                # DoorDash still uses its established ORANGE full-output path.
+                supp_file = final_files_dir / ctx["output_file"]
+                shutil.copy(str(combined_path), str(supp_file))
+                _verify_local_file(log, "DoorDash ORANGE CSV", supp_file)
+                log.info(f"  DoorDash ORANGE CSV retained -> {supp_file}")
 
         _cleanup_channel_tmp(channel_tmp, log)
 
         # ── STEP 7/7 ──────────────────────────────────────────────────────
-        _step(log, 7, TOTAL_STEPS, "FTP upload (ORANGE suppression email list + mailing ZIP)", channel_name)
+        _step(log, 7, TOTAL_STEPS, f"FTP upload -> {output_file}", channel_name)
         update_request_status(request_id, "Posting To FTP", channel_status, log)
-
-        # ORANGE suppression: email-only CSV
-        ftp_path_supp = _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
-
-        # ORANGE mailing: ESP-split ZIP
-        ftp_path_zip = _post_to_ftp(final_files_dir, ctx["path_date"], zip_out_name, log)
-
-        # Persist the mailing ZIP FTP path (primary deliverable for ORANGE)
-        update_ftp_path(request_id, channel_name, ftp_path_zip, log, total_count)
-        log.info(f"  STEP 7 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path_zip}")
+        if legacy_doordash_output:
+            _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
+        ftp_path = _post_to_ftp(final_files_dir, ctx["path_date"], output_file, log)
+        update_ftp_path(request_id, channel_name, ftp_path, log, record_count)
+        log.info(f"  STEP 7 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path}")
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status, log)
@@ -1183,14 +1379,13 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
         log.info("=" * 70)
         log.info(f"  ORANGE CHANNEL (ZIPS) PROCESSING COMPLETED SUCCESSFULLY")
         log.info(f"  Total elapsed   : {elapsed:.2f}s")
-        log.info(f"  Final file      : FINAL_FILES/{zip_out_name}")
-        log.info(f"  Total records   : {total_count:,}")
-        log.info(f"  FTP path (ZIP)  : {ftp_path_zip}")
-        log.info(f"  FTP path (supp) : {ftp_path_supp}")
+        log.info(f"  Final file      : FINAL_FILES/{output_file}")
+        log.info(f"  Total records   : {record_count:,}")
+        log.info(f"  FTP path        : {ftp_path}")
         log.info("=" * 70)
 
         result = _success_result(
-            channel_name, zip_out_name, str(zip_out), elapsed, total_count
+            channel_name, output_file, str(final_file_path), elapsed, record_count
         )
         result["merge_mode"] = merge_mode
         return result
@@ -1254,6 +1449,15 @@ def process_zip_request(
     else:
         channels_to_run = [ch.upper() for ch in channel if ch.upper() in CHANNELS]
 
+    requested_channels = [str(ch).upper() for ch in channel]
+    invalid_channels = [ch for ch in requested_channels if ch != "ALL" and ch not in CHANNELS]
+    if invalid_channels:
+        raise ValueError(
+            "Unsupported ZIP channel(s): " + ", ".join(invalid_channels)
+        )
+    if not channels_to_run:
+        raise ValueError("At least one supported channel must be selected for a ZIP request.")
+
     log.info(f"  Channels to run: {channels_to_run}")
 
     # ── Fetch request details (for comp_type) ─────────────────────────────
@@ -1263,6 +1467,16 @@ def process_zip_request(
 
     comp_type = request_data["comp_type"]  # 'include' | 'exclude'
     log.info(f"  comp_type: {comp_type}")
+    _verify_local_file(log, "uploaded ZIP input", zip_file)
+    _trace(
+        log, "request validation passed", request_type=request_data["request_type"],
+        comparison=comp_type, selected_channels=",".join(channels_to_run),
+        responder_match=bool(request_data.get("responder_match")),
+        responder_days=(request_data.get("responder_days")
+                        if request_data.get("responder_match") else "not enabled"),
+        merge_source_request_id=(request_data.get("merge_source_request_id") or "NULL"),
+        execution_mode=("single-channel" if len(channels_to_run) == 1 else "parallel"),
+    )
 
     # ── PRE-CHANNEL STEP A: Upload ZIP file -> S3 ─────────────────────────
     path_date   = datetime.now().strftime("%Y%m%d")
@@ -1272,6 +1486,8 @@ def process_zip_request(
     log.info(f"  [PRE] Uploading ZIP codes file to S3: {s3_zip_path}")
     run_command(["aws", "s3", "cp", zip_file, s3_zip_path, "--quiet"])
     log.info(f"  [PRE] ZIP file uploaded -> {s3_zip_path}")
+    _trace(log, "ZIP input upload completed", local_file=zip_file,
+           local_size_bytes=Path(zip_file).stat().st_size, s3_path=s3_zip_path)
 
     # ── PRE-CHANNEL STEP B: Create shared ZIP staging table ONCE ─────────
     zip_staging_table = f"APT_CPA_ZIPS_STAGING_{ts}"
@@ -1290,6 +1506,8 @@ def process_zip_request(
 
     # ── Channel processor map ──────────────────────────────────────────────
     def _run_channel(ch):
+        _trace(log, "dispatching channel", channel=ch,
+               processor=("GREEN_BLUE" if ch in ("GREEN", "BLUE") else ch))
         if ch in ("GREEN", "BLUE"):
             return process_green_blue_zip(request_id, ch, zip_staging_table, run_dir)
         elif ch == "ARCAMAX":
@@ -1367,6 +1585,11 @@ def process_zip_request(
         + f"\n{'=' * 60}"
     )
     log.info(summary)
+    _trace(log, "orchestrator result validation",
+           requested_channels=",".join(channels_to_run),
+           completed_channels=",".join(sorted(results.keys())) or "none",
+           failed_channels=",".join(ch for ch, _ in errors) or "none",
+           total_records=total_records)
 
     if errors:
         send_error_email(
@@ -1382,19 +1605,6 @@ def process_zip_request(
             "ZIP request failed for channel(s): "
             + "; ".join(f"{channel}: {error}" for channel, error in errors)
         )
-
-
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 4:
-        print("Usage: zips.py <request_id> <zip_file> <channel> [output_dir]")
-        sys.exit(1)
-    process_zip_request(
-        request_id=int(sys.argv[1]),
-        zip_file=sys.argv[2],
-        channel=sys.argv[3],
-        output_dir=sys.argv[4] if len(sys.argv) > 4 else ".",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1427,3 +1637,658 @@ def _build_common_context(request_id, channel_name, run_dir):
 def _post_to_ftp(final_files_dir, path_date, output_file, log, request_type=None):
     request_type = request_type or _REQUEST_TYPE_BY_FINAL_DIR.get(str(Path(final_files_dir)), "Suppression")
     return _ORIGINAL_POST_TO_FTP(final_files_dir, f"{path_date}/{request_type}", output_file, log)
+
+
+# =============================================================================
+# Consolidated non-DoorDash criteria processor
+# =============================================================================
+#
+# The original ZIP-only functions above remain private compatibility helpers for
+# the DoorDash workflow.  All Suppression and Mailing requests now enter through
+# process_request() below, regardless of whether they contain one criterion or
+# a mixture of Age, State, ZIP, and Gender criteria.
+
+CONSOLIDATED_CRITERIA = ("age", "state", "zips", "gender")
+
+# These defaults follow the existing AGE/STATE/ZIP source aliases.  They are
+# deliberately configurable because a source schema can use a different gender
+# column name without requiring a code release.
+GENDER_COLUMNS = {
+    "GREEN": os.environ.get("CPA_GENDER_GREEN_COLUMN", "b.GENDER"),
+    "BLUE": os.environ.get("CPA_GENDER_BLUE_COLUMN", "b.GENDER"),
+    "ARCAMAX": os.environ.get("CPA_GENDER_ARCAMAX_COLUMN", "GENDER"),
+    "ORANGE": os.environ.get("CPA_GENDER_ORANGE_COLUMN", "a.GENDER"),
+}
+
+
+def get_dob_cutoff(min_age, comp_type=None):
+    """Return the date boundary used by DOB-based channel sources."""
+    del comp_type
+    return (date.today() - timedelta(days=365.25 * int(min_age))).strftime("%Y-%m-%d")
+
+
+def _safe_identifier(value):
+    return re.sub(r"[^A-Za-z0-9_]", "_", str(value or ""))
+
+
+def _safe_sql_identifier(value, label):
+    value = str(value or "").strip()
+    if not value or not re.match(r"^[A-Za-z_][A-Za-z0-9_.]*$", value):
+        raise ValueError("Invalid {0} SQL identifier.".format(label))
+    return value
+
+
+def _criterion_values(item):
+    """Return a cleaned list for state/gender criteria."""
+    values = item.get("values")
+    if values is None:
+        values = item.get("value", "")
+    if isinstance(values, str):
+        values = values.split(",")
+    if not isinstance(values, (list, tuple)):
+        values = [values]
+    return [str(value).strip().upper() for value in values if str(value).strip()]
+
+
+def _fetch_consolidated_request(request_id):
+    """Read every persisted input needed by the unified processor."""
+    conn = get_db_with_retry()
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(
+                """
+                SELECT r.id, r.request_name, r.client_name, r.request_type,
+                       r.criteria_type, r.comp_type, r.criteria_value,
+                       r.criteria_json, r.zip_file_path, r.channel,
+                       r.output_dir, r.merge_source_request_id,
+                       r.responder_match, r.responder_days, u.username
+                  FROM requests r
+                  JOIN users u ON u.id = r.created_by
+                 WHERE r.id=%s
+                """,
+                (request_id,),
+            )
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def _criteria_from_request(request_data):
+    """Normalise new JSON criteria and legacy one-criterion request rows."""
+    raw_json = request_data.get("criteria_json")
+    if raw_json:
+        try:
+            criteria = json.loads(raw_json)
+        except (TypeError, ValueError):
+            raise ValueError("Saved criteria_json is invalid for this request.")
+    else:
+        criteria_type = str(request_data.get("criteria_type") or "").lower()
+        comparison = str(request_data.get("comp_type") or "").lower()
+        value = request_data.get("criteria_value") or ""
+        if criteria_type == "age":
+            if comparison == "between":
+                parts = [part.strip() for part in str(value).split(",", 1)]
+                if len(parts) != 2:
+                    raise ValueError("Legacy Age Between request requires two values.")
+                criteria = [{"type": "age", "comparison": comparison,
+                             "from": parts[0], "to": parts[1]}]
+            else:
+                criteria = [{"type": "age", "comparison": comparison,
+                             "value": str(value)}]
+        elif criteria_type in ("state", "gender"):
+            criteria = [{"type": criteria_type, "comparison": comparison,
+                         "values": [part.strip() for part in str(value).split(",")
+                                    if part.strip()]}]
+        elif criteria_type in ("zip", "zips"):
+            criteria = [{"type": "zips", "comparison": comparison,
+                         "file_path": request_data.get("zip_file_path")}]
+        else:
+            raise ValueError("Request has no supported criteria definition.")
+
+    if not isinstance(criteria, list) or not criteria:
+        raise ValueError("At least one criterion is required.")
+    if len(criteria) > len(CONSOLIDATED_CRITERIA):
+        raise ValueError("A request can contain at most Age, State, ZIP, and Gender.")
+
+    normalised = []
+    seen = set()
+    for raw_item in criteria:
+        if not isinstance(raw_item, dict):
+            raise ValueError("Each criterion must be an object.")
+        item = dict(raw_item)
+        item_type = str(item.get("type") or "").lower()
+        if item_type == "zip":
+            item_type = "zips"
+        comparison = str(item.get("comparison") or "").lower()
+        if item_type not in CONSOLIDATED_CRITERIA:
+            raise ValueError("Unsupported criterion: {0}".format(item_type))
+        if item_type in seen:
+            raise ValueError("Each criterion can be selected only once.")
+        seen.add(item_type)
+        item["type"] = item_type
+        item["comparison"] = comparison
+
+        if item_type == "age":
+            if comparison == "between":
+                try:
+                    item["from"] = str(int(item.get("from")))
+                    item["to"] = str(int(item.get("to")))
+                except (TypeError, ValueError):
+                    raise ValueError("Age Between requires numeric From and To values.")
+            elif comparison in ("greater", "less"):
+                try:
+                    item["value"] = str(int(item.get("value")))
+                except (TypeError, ValueError):
+                    raise ValueError("Age requires a numeric value.")
+            else:
+                raise ValueError("Age supports Greater Than, Lesser Than, or Between.")
+        elif item_type in ("state", "gender"):
+            item["values"] = _criterion_values(item)
+            if comparison not in ("include", "exclude") or not item["values"]:
+                raise ValueError(
+                    "{0} requires Include/Exclude and at least one value."
+                    .format(item_type.title())
+                )
+        elif item_type == "zips":
+            if comparison not in ("include", "exclude"):
+                raise ValueError("ZIP supports Include or Exclude.")
+        normalised.append(item)
+    return normalised
+
+
+def _column_map(channel):
+    channel = str(channel).upper()
+    if channel in ("GREEN", "BLUE"):
+        return {"age": "b.AGE", "state": "b.STATE", "zips": "b.ZIP",
+                "gender": _safe_sql_identifier(GENDER_COLUMNS[channel], "gender")}
+    if channel == "ARCAMAX":
+        return {"age": "birthday", "state": "STATE", "zips": "ZIP",
+                "gender": _safe_sql_identifier(GENDER_COLUMNS[channel], "gender")}
+    if channel == "ORANGE":
+        return {"age": "a.dob", "state": "a.STATE", "zips": "a.ZIP",
+                "gender": _safe_sql_identifier(GENDER_COLUMNS[channel], "gender")}
+    raise ValueError("Unsupported channel: {0}".format(channel))
+
+
+def _criteria_predicate(channel, criteria, zip_staging_table, log):
+    """Build the OR condition used for one channel's source query."""
+    channel = str(channel).upper()
+    columns = _column_map(channel)
+    conditions = []
+    for item in criteria:
+        item_type = item["type"]
+        comparison = item["comparison"]
+        _trace(log, "criterion resolved", channel=channel, criterion=item_type,
+               comparison=comparison,
+               values=(item.get("values") or item.get("value") or
+                       "{0},{1}".format(item.get("from", ""), item.get("to", ""))),
+               zip_staging_table=(zip_staging_table or "not used"))
+        if item_type == "age":
+            column = columns["age"]
+            if comparison == "between":
+                low, high = sorted((int(item["from"]), int(item["to"])))
+                if channel in ("GREEN", "BLUE"):
+                    conditions.append("{0} BETWEEN {1} AND {2}".format(column, low, high))
+                else:
+                    conditions.append(
+                        "TRY_TO_DATE({0}) BETWEEN '{1}' AND '{2}'".format(
+                            column, get_dob_cutoff(high), get_dob_cutoff(low)
+                        )
+                    )
+            else:
+                age_value = int(item["value"])
+                if channel in ("GREEN", "BLUE"):
+                    operator = ">=" if comparison == "greater" else "<"
+                    conditions.append("{0} {1} {2}".format(column, operator, age_value))
+                else:
+                    operator = "<=" if comparison == "greater" else ">="
+                    conditions.append(
+                        "TRY_TO_DATE({0}) {1} '{2}'".format(
+                            column, operator, get_dob_cutoff(age_value)
+                        )
+                    )
+        elif item_type in ("state", "gender"):
+            values = [value.replace("'", "''") for value in item["values"]]
+            operator = "IN" if comparison == "include" else "NOT IN"
+            conditions.append(
+                "{0} {1} ({2})".format(
+                    columns[item_type], operator,
+                    ",".join("'{0}'".format(value) for value in values)
+                )
+            )
+        elif item_type == "zips":
+            if not zip_staging_table:
+                raise ValueError("ZIP criterion requires a populated ZIP staging table.")
+            operator = "IN" if comparison == "include" else "NOT IN"
+            conditions.append(
+                "{0} {1} (SELECT zip_code FROM {2})".format(
+                    columns["zips"], operator, _safe_sql_identifier(zip_staging_table, "ZIP staging table")
+                )
+            )
+    if not conditions:
+        raise ValueError("At least one valid criterion is required.")
+    predicate = "(" + " OR ".join("(" + condition + ")" for condition in conditions) + ")"
+    _trace(log, "OR predicate validated", channel=channel, predicate=predicate,
+           predicate_count=len(conditions))
+    return predicate
+
+
+def _create_criteria_channel_table(perm_table, channel, criteria,
+                                   zip_staging_table, responder_match,
+                                   responder_days, log):
+    """Create one channel's standardised table for any supported criteria set."""
+    os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
+    channel = str(channel).upper()
+    predicate = _criteria_predicate(channel, criteria, zip_staging_table, log)
+    responder_join = _responder_join(channel, responder_match, responder_days)
+    if channel in ("GREEN", "BLUE"):
+        profile_table = (
+            "GREEN_LPT.UNIVERSAL_PROFILE" if channel == "GREEN"
+            else "INFS_LPT.INFS_PROFILE"
+        )
+        sql = (
+            "CREATE OR REPLACE TABLE {perm} AS "
+            "SELECT a.email, b.ZIP FROM {profile} a "
+            "JOIN APT_CUSTOM_GREEN_REA_DATA_DND b ON a.md5hash=b.EMAIL_MD5 "
+            "{responder_join}WHERE {predicate};"
+        ).format(perm=perm_table, profile=profile_table,
+                 responder_join=responder_join, predicate=predicate)
+    elif channel == "ARCAMAX":
+        sql = (
+            "CREATE OR REPLACE TABLE {perm} AS "
+            "SELECT email, ZIP FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
+            "WHERE {predicate};"
+        ).format(perm=perm_table, predicate=predicate)
+    else:
+        sql = (
+            "CREATE OR REPLACE TABLE {perm} AS "
+            "SELECT a.email_address, a.ZIP, esp.ACCOUNT_NAME "
+            "FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a "
+            "JOIN APT_ADHOC_JAIDEEP_ZIP_ESP_DETAILS_INCLUDE_ORANGE_20260604 esp "
+            "ON a.FEED_ID=esp.FEEDID "
+            "JOIN APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND p "
+            "ON a.email_address=p.email_address "
+            "{responder_join}WHERE {predicate} "
+            "QUALIFY ROW_NUMBER() OVER (PARTITION BY a.email_address "
+            "ORDER BY a.created_at DESC)=1;"
+        ).format(perm=perm_table, responder_join=responder_join,
+                 predicate=predicate)
+    _trace(log, "Snowflake criteria table creation", channel=channel,
+           target_table=perm_table, responder_match=bool(responder_match),
+           responder_days=(responder_days if responder_match else "not enabled"),
+           sql=_safe_sql_for_log(sql))
+    run_command(["snowsql", "-c", "datateam1", "-q", sql])
+    count = _query_snowflake("SELECT COUNT(*) FROM {0}".format(perm_table), log)
+    _trace(log, "Snowflake criteria table validated", channel=channel,
+           target_table=perm_table, row_count=count)
+    return count
+
+
+def _consolidated_context(request_data, criteria, channel, run_dir):
+    """Build paths/names without relying on the retired processor modules."""
+    channel = str(channel).upper()
+    path_date = datetime.now().strftime("%Y%m%d")
+    request_type = str(request_data["request_type"])
+    request_name = _safe_identifier(request_data["request_name"])
+    client_name = _safe_filename_part(request_data["client_name"])
+    criteria_label = _safe_filename_part(
+        "Multi" if len(criteria) > 1 else str(criteria[0]["type"]).title()
+    )
+    final_files_dir = Path(run_dir) / "FINAL_FILES"
+    channel_tmp = Path(run_dir) / (channel + "_criteria_tmp")
+    final_files_dir.mkdir(parents=True, exist_ok=True)
+    channel_tmp.mkdir(parents=True, exist_ok=True)
+    return {
+        "path_date": path_date,
+        "final_files_dir": final_files_dir,
+        "channel_tmp": channel_tmp,
+        "perm_table": "APT_CPA_REQUEST_{0}_{1}_{2}".format(
+            channel, request_data["id"], path_date
+        ),
+        "path_FINAL": "{0}/{1}/{2}/{3}/{4}_FINAL".format(
+            S3_BASE, request_type, path_date, request_name, channel
+        ),
+        "path_COMPLETE": "{0}/{1}/{2}/{3}/{4}_COMPLETE".format(
+            S3_BASE, request_type, path_date, request_name, channel
+        ),
+        "output_file": "{0}_{1}_{2}_{3}_{4}.csv".format(
+            client_name, criteria_label, _safe_filename_part(request_type), channel, path_date
+        ),
+    }
+
+
+def _write_orange_delivery(raw_file, context, request_type, log):
+    """Create Orange delivery output without loading a large file into memory.
+
+    The Snowflake FINAL export is already email-deduplicated.  This function
+    therefore streams it once: Suppression writes an email-only file, while
+    Mailing writes one file per ESP/account and then creates an archive.
+    """
+    raw_file = Path(raw_file)
+    final_dir = context["final_files_dir"]
+    _verify_local_file(log, "Orange raw output", raw_file)
+
+    with open(str(raw_file), "r", newline="") as source:
+        reader = csv.DictReader(source, delimiter="|")
+        fieldnames = reader.fieldnames or []
+        email_column = "email_address" if "email_address" in fieldnames else "email"
+        account_column = "account_name"
+        if email_column not in fieldnames or account_column not in fieldnames:
+            raise RuntimeError(
+                "Orange raw output must contain email/email_address and account_name columns."
+            )
+        _trace(log, "Orange raw delivery header validated", raw_file=raw_file,
+               email_column=email_column, account_column=account_column,
+               request_type=request_type)
+
+        if str(request_type).lower() == "suppression":
+            final_file = final_dir / context["output_file"]
+            record_count = 0
+            with open(str(final_file), "w", newline="") as destination:
+                writer = csv.writer(destination, lineterminator="\n")
+                for row in reader:
+                    email = str(row.get(email_column) or "").strip()
+                    if not email:
+                        continue
+                    writer.writerow([email])
+                    record_count += 1
+            _verify_local_file(log, "Orange suppression delivery", final_file)
+            _trace(log, "Orange suppression delivery created",
+                   filename=final_file.name, row_count=record_count)
+            return final_file.name, final_file, record_count
+
+        esp_dir = context["channel_tmp"] / "ORANGE_ESP"
+        esp_dir.mkdir(exist_ok=True)
+        open_outputs = {}
+        counts = {}
+        try:
+            for row in reader:
+                email = str(row.get(email_column) or "").strip()
+                account = str(row.get(account_column) or "").strip()
+                if not email:
+                    continue
+                if not account:
+                    raise RuntimeError(
+                        "Orange Mailing output contains an email without an ESP/account_name. "
+                        "The source data must include an ESP mapping before merge/delivery."
+                    )
+                if account not in open_outputs:
+                    filename = "{0}_ORANGE_DATA.csv".format(
+                        _safe_filename_part(account) or "UNKNOWN_ESP"
+                    )
+                    output = esp_dir / filename
+                    handle = open(str(output), "w", newline="")
+                    open_outputs[account] = (output, handle, csv.writer(handle, lineterminator="\n"))
+                    counts[account] = 0
+                output, handle, writer = open_outputs[account]
+                del output, handle
+                writer.writerow([email])
+                counts[account] += 1
+        finally:
+            for output, handle, writer in open_outputs.values():
+                del output, writer
+                handle.close()
+
+    if not counts:
+        raise RuntimeError("Orange Mailing output has no ESP/account_name values.")
+    record_count = 0
+    for account, count in sorted(counts.items()):
+        output = open_outputs[account][0]
+        _verify_local_file(log, "Orange ESP delivery ({0})".format(account), output)
+        record_count += count
+        _trace(log, "Orange ESP delivery created", account_name=account,
+               filename=output.name, unique_email_count=count)
+    archive_name = Path(context["output_file"]).with_suffix(".zip").name
+    archive_file = final_dir / archive_name
+    run_command(["zip", "-r", str(archive_file), esp_dir.name], cwd=str(context["channel_tmp"]))
+    _verify_local_file(log, "Orange Mailing ESP archive", archive_file)
+    _trace(log, "Orange Mailing ESP archive created", archive_file=archive_file,
+           account_count=len(counts), row_count=record_count)
+    return archive_name, archive_file, record_count
+
+
+def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir, channel):
+    """Run one complete non-DoorDash channel using the common criteria engine."""
+    channel = str(channel).upper()
+    request_id = request_data["id"]
+    context = _consolidated_context(request_data, criteria, channel, run_dir)
+    log = setup_processor_channel_logging(run_dir, channel)
+    started = time.time()
+    table_created = False
+    _trace(log, "consolidated channel start", request_id=request_id, channel=channel,
+           criteria_json=json.dumps(criteria, sort_keys=True),
+           zip_staging_table=(zip_staging_table or "not used"),
+           merge_source_request_id=(request_data.get("merge_source_request_id") or "NULL"),
+           final_s3=context["path_FINAL"], complete_s3=context["path_COMPLETE"])
+    try:
+        update_request_status(request_id, "Started", channel + "_STATUS", log)
+        _step(log, 1, 9, "Creating Snowflake criteria table", channel)
+        update_request_status(request_id, "Loading to Snowflake", channel + "_STATUS", log)
+        count = _create_criteria_channel_table(
+            context["perm_table"], channel, criteria, zip_staging_table,
+            request_data.get("responder_match"), request_data.get("responder_days"), log
+        )
+        table_created = True
+        if count == 0:
+            update_request_status(request_id, "No Data Retrieved", channel + "_STATUS", log)
+            _drop_perm_table(context["perm_table"], log)
+            table_created = False
+            return {"channel": channel, "status": "NO_DATA", "count": 0,
+                    "file": None, "elapsed": time.time() - started}
+
+        _step(log, 2, 9, "Exporting final data to S3", channel)
+        update_request_status(request_id, "Exporting Final File", channel + "_STATUS", log)
+        _export_complete_final_file("FINAL", context["perm_table"], context["path_FINAL"], channel, log)
+        _step(log, 3, 9, "Exporting complete audit data to S3", channel)
+        update_request_status(request_id, "Exporting Complete File", channel + "_STATUS", log)
+        _export_complete_final_file("COMPLETE", context["perm_table"], context["path_COMPLETE"], channel, log)
+
+        _step(log, 4, 9, "Dropping validated Snowflake table", channel)
+        _drop_perm_table(context["perm_table"], log)
+        table_created = False
+
+        _step(log, 5, 9, "Downloading and combining final S3 data", channel)
+        update_request_status(request_id, "Combining Data", channel + "_STATUS", log)
+        raw_file = context["channel_tmp"] / context["output_file"]
+        _download_and_combine(
+            context["path_FINAL"], context["channel_tmp"] / "download",
+            context["channel_tmp"], context["output_file"], channel, log
+        )
+        _verify_local_file(log, "combined current output", raw_file)
+
+        _step(log, 6, 9, "Applying optional previous-output merge", channel)
+        if request_data.get("merge_source_request_id"):
+            merge_result = merge_current_file(
+                request_id, request_data["merge_source_request_id"], channel,
+                raw_file, context["path_FINAL"], context["channel_tmp"], log
+            )
+            count = merge_result["count"]
+            merge_mode = merge_result["merge_mode"]
+            output_s3 = merge_result["s3_path"]
+            _verify_local_file(log, "merged current output", raw_file)
+        else:
+            count = max(_count_file_lines(str(raw_file)) - 1, 0)
+            merge_mode = "CURRENT_ONLY"
+            output_s3 = context["path_FINAL"]
+            _trace(log, "merge skipped", channel=channel,
+                   reason="merge_source_request_id is NULL", row_count=count)
+
+        _step(log, 7, 9, "Building current request delivery artifact", channel)
+        if channel == "ORANGE":
+            output_name, final_file, count = _write_orange_delivery(
+                raw_file, context, request_data["request_type"], log
+            )
+        else:
+            output_name = context["output_file"]
+            final_file = context["final_files_dir"] / output_name
+            shutil.move(str(raw_file), str(final_file))
+            _verify_local_file(log, "final delivery file", final_file)
+
+        _step(log, 8, 9, "Persisting output details", channel)
+        if merge_mode == "CURRENT_ONLY":
+            update_channel_storage(request_id, channel, output_s3, count, log)
+        update_request_status(request_id, "Posting To FTP", channel + "_STATUS", log)
+
+        _step(log, 9, 9, "Posting delivery artifact to FTP", channel)
+        ftp_path = _post_to_ftp(
+            context["final_files_dir"], context["path_date"], output_name, log,
+            request_type=request_data["request_type"],
+        )
+        update_ftp_path(request_id, channel, ftp_path, log, count)
+        update_request_status(request_id, "Completed", channel + "_STATUS", log)
+        elapsed = time.time() - started
+        _trace(log, "consolidated channel completed", channel=channel,
+               row_count=count, merge_mode=merge_mode, s3_path=output_s3,
+               ftp_path=ftp_path, final_file=final_file,
+               elapsed_seconds="{0:.2f}".format(elapsed))
+        return {"channel": channel, "status": "SUCCESS", "count": count,
+                "file": output_name, "final_file_path": str(final_file),
+                "ftp_path": ftp_path, "s3_path": output_s3,
+                "merge_mode": merge_mode, "elapsed": elapsed}
+    except Exception as exc:
+        if table_created:
+            try:
+                _drop_perm_table(context["perm_table"], log)
+            except Exception:
+                log.exception("Unable to drop failed criteria table %s", context["perm_table"])
+        update_request_status(request_id, "Failed", channel + "_STATUS", log)
+        _trace(log, "consolidated channel failed", channel=channel, error=exc)
+        log.exception("Consolidated channel failed: %s", channel)
+        raise
+    finally:
+        shutil.rmtree(str(context["channel_tmp"]), ignore_errors=True)
+
+
+def _set_request_overall_status(request_id, status, log):
+    conn = get_db_with_retry(log)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE requests SET overall_status=%s WHERE id=%s", (status, request_id))
+        conn.commit()
+    finally:
+        conn.close()
+    _trace(log, "overall status updated", request_id=request_id, overall_status=status)
+
+
+def process_request(request_id, channel, output_dir=None, zip_file=None):
+    """Run any non-DoorDash request through one consolidated processor."""
+    request_data = _fetch_consolidated_request(request_id)
+    if not request_data:
+        raise RuntimeError("Request ID {0} was not found.".format(request_id))
+    if request_data["request_type"] == "Doordash":
+        raise RuntimeError("DoorDash requests must use Doordash/doordash_zips.py.")
+    criteria = _criteria_from_request(request_data)
+
+    requested_channels = [channel.upper()] if isinstance(channel, str) else [str(item).upper() for item in channel]
+    invalid_channels = [item for item in requested_channels if item != "ALL" and item not in CHANNELS]
+    if invalid_channels:
+        raise ValueError("Unsupported channel(s): " + ", ".join(invalid_channels))
+    channels_to_run = list(CHANNELS) if "ALL" in requested_channels else list(dict.fromkeys(requested_channels))
+    if not channels_to_run:
+        raise ValueError("At least one channel must be selected.")
+
+    run_dir = Path(ensure_output_dir(output_dir or request_data["output_dir"], "criteria"))
+    (run_dir / "FINAL_FILES").mkdir(parents=True, exist_ok=True)
+    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+    log = setup_processor_main_logging(run_dir)
+    _trace(log, "consolidated request started", request_id=request_id,
+           request_name=request_data["request_name"], request_type=request_data["request_type"],
+           criteria_json=json.dumps(criteria, sort_keys=True),
+           channels=",".join(channels_to_run), output_dir=run_dir)
+
+    zip_staging_table = None
+    try:
+        zip_criteria = [item for item in criteria if item["type"] == "zips"]
+        if zip_criteria:
+            selected_zip_file = zip_file or zip_criteria[0].get("file_path") or request_data.get("zip_file_path")
+            if not selected_zip_file:
+                raise RuntimeError("ZIP criterion has no uploaded ZIP file.")
+            _verify_local_file(log, "consolidated ZIP input", selected_zip_file)
+            path_date = datetime.now().strftime("%Y%m%d")
+            s3_zip = "{0}/{1}/ZIPS/{2}/{3}/staging/{4}".format(
+                S3_BASE, request_data["request_type"], path_date,
+                _safe_identifier(request_data["request_name"]), Path(selected_zip_file).name
+            )
+            _step(log, 1, 4, "Uploading and staging ZIP input", "REQUEST")
+            run_command(["aws", "s3", "cp", selected_zip_file, s3_zip, "--quiet"])
+            zip_staging_table = "APT_CPA_REQUEST_ZIPS_{0}_{1}".format(request_id, datetime.now().strftime("%H%M%S"))
+            _create_zip_staging_table(zip_staging_table, log)
+            zip_count = _load_zips_from_s3(zip_staging_table, s3_zip, log)
+            if zip_count <= 0:
+                raise RuntimeError("ZIP criterion file contains no ZIP values.")
+            _trace(log, "ZIP staging validated", staging_table=zip_staging_table,
+                   zip_count=zip_count, s3_path=s3_zip)
+        else:
+            _trace(log, "ZIP staging skipped", reason="no ZIP criterion")
+
+        for selected_channel in channels_to_run:
+            update_request_status(request_id, "Queued", selected_channel + "_STATUS", log)
+
+        _step(log, 2, 4, "Processing selected channels", "REQUEST")
+        results = {}
+        errors = []
+        if len(channels_to_run) == 1:
+            selected_channel = channels_to_run[0]
+            try:
+                results[selected_channel] = _process_criteria_channel(
+                    request_data, criteria, zip_staging_table, run_dir, selected_channel
+                )
+            except Exception as exc:
+                errors.append("{0}: {1}".format(selected_channel, exc))
+        else:
+            with ThreadPoolExecutor(max_workers=len(channels_to_run)) as executor:
+                futures = {
+                    executor.submit(_process_criteria_channel, request_data, criteria,
+                                    zip_staging_table, run_dir, selected_channel): selected_channel
+                    for selected_channel in channels_to_run
+                }
+                for future in as_completed(futures):
+                    selected_channel = futures[future]
+                    try:
+                        results[selected_channel] = future.result()
+                    except Exception as exc:
+                        errors.append("{0}: {1}".format(selected_channel, exc))
+
+        _step(log, 3, 4, "Finalising request status and notification", "REQUEST")
+        if errors:
+            _set_request_overall_status(request_id, "failed", log)
+            message = "; ".join(errors)
+            send_error_email(request_data, message, run_dir)
+            raise RuntimeError("Request failed for channel(s): " + message)
+        _set_request_overall_status(request_id, "completed", log)
+        send_success_email(request_data, results, run_dir)
+        _trace(log, "consolidated request completed", request_id=request_id,
+               completed_channels=",".join(sorted(results.keys())),
+               total_rows=sum(result.get("count", 0) for result in results.values()))
+        return results
+    except Exception as exc:
+        _set_request_overall_status(request_id, "failed", log)
+        _trace(log, "consolidated request failed", request_id=request_id, error=exc)
+        raise
+    finally:
+        if zip_staging_table:
+            try:
+                _step(log, 4, 4, "Dropping ZIP staging table", "REQUEST")
+                _drop_zip_staging_table(zip_staging_table, log)
+            except Exception:
+                log.exception("Unable to drop consolidated ZIP staging table")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Run a consolidated Suppression/Mailing criteria request."
+    )
+    parser.add_argument("--request-id", required=True, type=int)
+    parser.add_argument("--channel", required=True, action="append",
+                        choices=["ALL", "GREEN", "BLUE", "ARCAMAX", "ORANGE"])
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--zip-file")
+    cli_args = parser.parse_args()
+    process_request(
+        request_id=cli_args.request_id,
+        channel=cli_args.channel,
+        output_dir=cli_args.output_dir,
+        zip_file=cli_args.zip_file,
+    )

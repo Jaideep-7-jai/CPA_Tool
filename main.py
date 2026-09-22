@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""
-CPA Tool – Entry point
-Routes incoming requests to the correct processing module:
-  age / state  → AGE_STATE/age_state_new.py  (process_age_state_request)
-  zips         → ZIPS/zips.py  (Suppression / Mailing)
-  doordash     → Doordash/doordash_zips.py
+"""CPA Tool command-line entry point.
+
+All Suppression and Mailing requests use the consolidated criteria processor,
+regardless of whether they use one criterion or a combination of Age, State,
+ZIP, and Gender.  DoorDash remains a dedicated ZIP workflow.
 """
 
 import argparse
@@ -21,7 +20,7 @@ def parse_args():
                         choices=["Suppression", "Mailing", "Doordash"],
                         help="Type of request")
     parser.add_argument("--criteria-type", required=True,
-                        choices=["age", "state", "zips", "multi"],
+                        choices=["age", "state", "zips", "gender", "multi"],
                         help="Criteria type")
     parser.add_argument("--comp-type",     required=True,
                         choices=["greater", "less", "between", "include", "exclude"],
@@ -35,14 +34,10 @@ def parse_args():
                         help="Channel(s) to process. Repeat flag for multiple: --channel GREEN --channel ORANGE")
     parser.add_argument("--output-dir",    required=True,
                         help="Output directory")
-    # Criteria-specific args
-    parser.add_argument("--age",default=None,
-                        help="Age value. A Between request uses the format minimum_age,maximum_age.",)
-    parser.add_argument("--states",        nargs="+", default=None)
     parser.add_argument("--zip-file",      default=None,
                         help="Path to uploaded ZIP codes file")
     parser.add_argument("--request-id",    type=int, default=None,
-                        help="DB request ID (required for age/state and zips processors)")
+                        help="DB request ID (required for all processors)")
     return parser.parse_args()
 
 
@@ -57,47 +52,30 @@ def main():
     if "ALL" in channels:
         channels = ["ALL"]
 
-    if criteria == "multi":
-        from MULTI_CRITERIA.multi_criteria import process_multi_criteria_request
-        if args.request_id is None:
-            print("[ERROR] --request-id is required for multi criteria", file=sys.stderr)
-            sys.exit(1)
-        process_multi_criteria_request(
-            request_id=args.request_id,
-            channel=channels,
-            output_dir=args.output_dir,
-        )
+    if args.request_id is None:
+        print("[ERROR] --request-id is required for every request", file=sys.stderr)
+        sys.exit(1)
 
-    elif criteria in ("age", "state"):
-        from AGE_STATE.age_state import process_age_state_request
-        if args.request_id is None:
-            print("[ERROR] --request-id is required for age/state criteria", file=sys.stderr)
+    if req_type == "Doordash":
+        if criteria != "zips":
+            print("[ERROR] DoorDash supports ZIP criteria only", file=sys.stderr)
             sys.exit(1)
-        process_age_state_request(
-            request_id=args.request_id,
-            channel=channels,
-        )
-
-    elif criteria == "zips":
-        if req_type == "Doordash":
-            from Doordash.doordash_zips import process_doordash_zip_request
-            processor = process_doordash_zip_request
-        else:
-            from ZIPS.zips import process_zip_request
-            processor = process_zip_request
-        if args.request_id is None:
-            print("[ERROR] --request-id is required for zips criteria", file=sys.stderr)
-            sys.exit(1)
-        processor(
+        from Doordash.doordash_zips import process_doordash_zip_request
+        process_doordash_zip_request(
             request_id=args.request_id,
             zip_file=args.zip_file,
             channel=channels,
             output_dir=args.output_dir,
         )
+        return
 
-    else:
-        print(f"[ERROR] Unknown criteria type: {criteria}", file=sys.stderr)
-        sys.exit(1)
+    from REQUEST_PROCESSOR.request_processor import process_request
+    process_request(
+        request_id=args.request_id,
+        channel=channels,
+        output_dir=args.output_dir,
+        zip_file=args.zip_file,
+    )
 
 
 if __name__ == "__main__":
