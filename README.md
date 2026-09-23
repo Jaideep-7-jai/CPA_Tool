@@ -82,7 +82,25 @@ export CPA_DB_NAME='CUST_TECH_DB'
 export CPA_FTP_USERNAME='…'
 export CPA_FTP_PASSWORD='…'
 export CPA_FTP_HOST='…'
+export CPA_EMAIL_TECH_RECIPIENTS='…'
+export CPA_EMAIL_DATATEAM_RECIPIENTS='…'
+export CPA_EMAIL_CPA_RECIPIENTS='…'
+export CPA_EMAIL_CPA_USERNAMES='cpauser'
 ```
+
+## Notification views
+
+Every completion/failure message includes a request-details table with request
+name, client name, request type, criteria/value/comparison, channels, responder
+match days, and merge source.  Error e-mails contain a short exit reason and a
+support-log location rather than embedding the full log.
+
+`CPA_EMAIL_CPA_USERNAMES` controls the FTP-only recipient view.  Those users
+receive file name, header, final count, FTP path, and merge status.  Technical
+and Data Team recipients additionally receive the local output location and
+the `FINAL`/`COMPLETE` S3 paths, headers, and counts.  `COMPLETE` is audit data
+and may include ZIP/account fields even when a delivery file contains only
+`email`.
 
 Use `.env.example` as the variable reference. Existing Snowflake/S3 settings
 remain in the deployment's protected runtime configuration.

@@ -136,6 +136,9 @@ def insert_complete_extract(request_id, channel_name, zip_staging_table, run_dir
             "channel": channel_name, "status": "COMPLETE_EXPORTED",
             "count": inserted_count if inserted_count >= 0 else 0,
             "elapsed": elapsed, "perm_table": perm_table,
+            "complete_s3_path": ctx["path_COMPLETE"],
+            "complete_data_header": "email|ZIP",
+            "complete_count": inserted_count if inserted_count >= 0 else "",
         }
     except Exception as exc:
         try:
@@ -181,6 +184,15 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
     md5_name = f"{client_name}_{criteria_type}_{request_type}_MD5HASH_{path_date}.csv"
     email_s3 = f"{S3_BASE}/Doordash/{path_date}/{request_data['request_name']}/FINAL_EMAIL"
     md5_s3 = f"{S3_BASE}/Doordash/{path_date}/{request_data['request_name']}/FINAL_ARCAMAX_MD5"
+    complete_paths = [
+        results[channel].get("complete_s3_path")
+        for channel in completed
+        if results[channel].get("complete_s3_path")
+    ]
+    complete_count = sum(
+        int(results[channel].get("complete_count") or 0)
+        for channel in completed
+    )
 
     _trace(
         log, "combined-output plan", request_name=request_data["request_name"],
@@ -209,13 +221,15 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
                selected_channels=",".join(completed), destination=email_s3)
         run_command(["snowsql", "-c", "datateam1", "-q", copy_email])
         _trace(log, "combined email export completed", destination=email_s3)
-        email_count = _download_and_combine(
+        email_line_count = _download_and_combine(
             email_s3, run_dir / "EMAIL_FINAL_DL", run_dir / "EMAIL_FINAL_TMP",
             email_name, "GREEN", log,
         )
+        email_count = max(email_line_count - 1, 0)
         _verify_local_file(log, "combined DoorDash email file",
                            run_dir / "EMAIL_FINAL_TMP" / email_name)
         _trace(log, "combined email download validated", email_count=email_count,
+               line_count_including_header=email_line_count,
                local_file=run_dir / "EMAIL_FINAL_TMP" / email_name)
         if arcamax_table:
             _step(log, 4, 7, "Exporting DoorDash MD5 file from ARCAMAX", "DOORDASH")
@@ -230,13 +244,15 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
                    destination=md5_s3)
             run_command(["snowsql", "-c", "datateam1", "-q", copy_md5])
             _trace(log, "combined MD5 export completed", destination=md5_s3)
-            md5_count = _download_and_combine(
+            md5_line_count = _download_and_combine(
                 md5_s3, run_dir / "MD5_FINAL_DL", run_dir / "MD5_FINAL_TMP",
                 md5_name, "GREEN", log,
             )
+            md5_count = max(md5_line_count - 1, 0)
             _verify_local_file(log, "combined DoorDash MD5 file",
                                run_dir / "MD5_FINAL_TMP" / md5_name)
             _trace(log, "combined MD5 download validated", md5_count=md5_count,
+                   line_count_including_header=md5_line_count,
                    local_file=run_dir / "MD5_FINAL_TMP" / md5_name)
         else:
             _trace(log, "MD5 output skipped",
@@ -275,7 +291,20 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
     _trace(log, "DoorDash email FTP validated", ftp_path=email_ftp_path,
            email_count=email_count, merge_mode=email_merge_mode)
     shutil.rmtree(str(run_dir / "EMAIL_FINAL_TMP"), ignore_errors=True)
-    outputs = [{"channel": "DOORDASH_EMAIL", "file": email_name, "final_file_path": str(email_dest), "status": "SUCCESS", "count": email_count, "s3_path": email_s3, "ftp_path": email_ftp_path, "merge_mode": email_merge_mode}]
+    outputs = [{
+        "channel": "DOORDASH_EMAIL", "file": email_name,
+        "final_file_path": str(email_dest), "status": "SUCCESS",
+        "count": email_count, "s3_path": email_s3,
+        "final_s3_path": email_s3, "final_data_header": "email",
+        "final_count": email_count,
+        "complete_s3_path": " | ".join(complete_paths),
+        "complete_data_header": "email|ZIP (per source channel)",
+        "complete_count": complete_count,
+        "ftp_path": email_ftp_path, "delivery_header": "email",
+        "merge_mode": email_merge_mode,
+        "merge_source_request_id": request_data.get("merge_source_request_id") or "",
+        "merge_source_request_name": request_data.get("merge_source_request_name") or "",
+    }]
 
     if arcamax_table:
         md5_dest = final_files_dir / md5_name
@@ -302,7 +331,20 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
         _trace(log, "DoorDash MD5 FTP validated", ftp_path=md5_ftp_path,
                md5_count=md5_count, merge_mode=md5_merge_mode)
         shutil.rmtree(str(run_dir / "MD5_FINAL_TMP"), ignore_errors=True)
-        outputs.append({"channel": "DOORDASH_ARCAMAX_MD5", "file": md5_name, "final_file_path": str(md5_dest), "status": "SUCCESS", "count": md5_count, "s3_path": md5_s3, "ftp_path": md5_ftp_path, "merge_mode": md5_merge_mode})
+        outputs.append({
+            "channel": "DOORDASH_ARCAMAX_MD5", "file": md5_name,
+            "final_file_path": str(md5_dest), "status": "SUCCESS",
+            "count": md5_count, "s3_path": md5_s3,
+            "final_s3_path": md5_s3, "final_data_header": "md5hash",
+            "final_count": md5_count,
+            "complete_s3_path": " | ".join(complete_paths),
+            "complete_data_header": "email|ZIP (per source channel)",
+            "complete_count": complete_count,
+            "ftp_path": md5_ftp_path, "delivery_header": "md5hash",
+            "merge_mode": md5_merge_mode,
+            "merge_source_request_id": request_data.get("merge_source_request_id") or "",
+            "merge_source_request_name": request_data.get("merge_source_request_name") or "",
+        })
     _trace(log, "combined-output generation completed", output_count=len(outputs),
            outputs=";".join(
                "{0}:{1}:{2}".format(item["channel"], item["count"], item["merge_mode"])
@@ -472,7 +514,13 @@ def process_doordash_zip_request(request_id: int, zip_file: str, channel, output
         error_summary = "\n".join(f"{channel_name}: {error}" for channel_name, error in errors)
         _trace(log, "DoorDash request failed", error_count=len(errors),
                failed_components=",".join(channel_name for channel_name, _ in errors))
-        send_error_email(request_data, error_summary, run_dir)
+        send_error_email(
+            request_data, error_summary, run_dir,
+            results={
+                **results,
+                **{output["channel"]: output for output in combined_outputs},
+            },
+        )
         raise RuntimeError(f"Doordash request failed:\n{error_summary}")
 
     notification_results = {

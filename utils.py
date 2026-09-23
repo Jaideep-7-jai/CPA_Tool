@@ -10,6 +10,7 @@ import gzip
 import shutil
 import logging
 import smtplib
+import html
 from typing import Tuple
 import subprocess
 from pathlib import Path
@@ -17,7 +18,19 @@ from typing import List, Dict, Optional, Union
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from config import DB_CONFIG, SENDER, RECIPIENT, CC_RECIPIENTS
+import config as _app_config
+
+
+# Keep the notification implementation compatible with both the newer
+# RECIPIENT/CC_RECIPIENTS settings and the repository's original distribution
+# list settings.  The latter are used when a deployed config.py has not yet
+# been updated with the newer names.
+DB_CONFIG = _app_config.DB_CONFIG
+SENDER = _app_config.SENDER
+RECIPIENT = getattr(_app_config, "RECIPIENT", "")
+CC_RECIPIENTS = getattr(_app_config, "CC_RECIPIENTS", "")
+LEGACY_TECH_RECIPIENTS = getattr(_app_config, "TECH_NOTIFICATION_RECIPIENTS", ())
+LEGACY_CPA_RECIPIENTS = getattr(_app_config, "CPAUSER_EMAIL", ())
 
 def ensure_output_dir(output_dir, criteria_type):
     """
@@ -146,27 +159,112 @@ def get_db_connection(channel):
     return config
 
 
-def send_email(subject, body_text, is_error=False):
-    """Email notification"""
+def _split_recipients(*values):
+    """Return an ordered, de-duplicated recipient list."""
+    recipients = []
+    seen = set()
+    for value in values:
+        items = value if isinstance(value, (list, tuple, set)) else (value,)
+        for item in items:
+            for address in str(item or "").replace(";", ",").split(","):
+                address = address.strip()
+                key = address.lower()
+                if address and key not in seen:
+                    recipients.append(address)
+                    seen.add(key)
+    return recipients
+
+
+def _is_truthy(value):
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _is_cpa_user(request_details):
+    """Identify CPA users without hard-coding an e-mail address in source."""
+    usernames = {
+        value.strip().lower()
+        for value in os.getenv("CPA_EMAIL_CPA_USERNAMES", "cpauser").split(",")
+        if value.strip()
+    }
+    return str((request_details or {}).get("username") or "").strip().lower() in usernames
+
+
+def _notification_recipients(request_details, is_error=False):
+    """Resolve notification recipients from service environment configuration.
+
+    The legacy RECIPIENT/CC_RECIPIENTS values remain safe fallbacks.  Configure
+    the environment variables below in production so recipient routing is not
+    embedded in Git:
+
+    * CPA_EMAIL_TECH_RECIPIENTS
+    * CPA_EMAIL_DATATEAM_RECIPIENTS
+    * CPA_EMAIL_CPA_RECIPIENTS
+    * CPA_EMAIL_CPA_USERNAMES
+    """
+    tech_recipients = _split_recipients(
+        os.getenv("CPA_EMAIL_TECH_RECIPIENTS", ""),
+        LEGACY_TECH_RECIPIENTS,
+        RECIPIENT,
+    )
+    datateam_recipients = _split_recipients(
+        os.getenv("CPA_EMAIL_DATATEAM_RECIPIENTS", ""),
+        CC_RECIPIENTS,
+    )
+    cpa_recipients = _split_recipients(
+        os.getenv("CPA_EMAIL_CPA_RECIPIENTS", ""),
+        LEGACY_CPA_RECIPIENTS,
+    )
+
+    if _is_cpa_user(request_details):
+        # CPA users receive the FTP-only view plus the Data Team.  If an
+        # operator has not configured a dedicated CPA distribution list, retain
+        # the old primary recipient rather than silently dropping a mail.
+        recipients = _split_recipients(
+            cpa_recipients or tech_recipients,
+            datateam_recipients,
+        )
+    else:
+        recipients = _split_recipients(tech_recipients, datateam_recipients)
+
+    if not recipients:
+        raise RuntimeError(
+            "No notification recipients are configured. Set CPA_EMAIL_*_RECIPIENTS."
+        )
+    return recipients
+
+
+def send_email(subject, body_text, is_error=False, html_body=None, recipients=None):
+    """Send a text and HTML notification and return whether SMTP accepted it."""
     try:
-        msg = MIMEMultipart()
-        msg['Subject'] = f"[{'ERROR' if is_error else 'SUCCESS'}] {subject}"
+        recipients = list(recipients or _split_recipients(
+            LEGACY_TECH_RECIPIENTS, RECIPIENT, CC_RECIPIENTS,
+        ))
+        if not recipients:
+            raise RuntimeError("No notification recipients are configured.")
+
+        msg = MIMEMultipart("alternative")
+        msg['Subject'] = "[{0}] {1}".format("ERROR" if is_error else "SUCCESS", subject)
         msg['From'] = SENDER
-        msg['To'] = RECIPIENT
-        msg['Cc'] = CC_RECIPIENTS
+        msg['To'] = recipients[0]
+        if len(recipients) > 1:
+            msg['Cc'] = ", ".join(recipients[1:])
+        msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
+        if html_body:
+            msg.attach(MIMEText(html_body, 'html', 'utf-8'))
 
-        msg_body = MIMEMultipart('alternative')
-        textpart = MIMEText(body_text, 'plain')
-        msg_body.attach(textpart)
-        msg.attach(msg_body)
-
-        all_recipients = [RECIPIENT] + CC_RECIPIENTS.split(',')
         server = smtplib.SMTP('localhost')
-        server.sendmail(SENDER, all_recipients, msg.as_string())
-        server.quit()
-        logging.info(f"{'ERROR' if is_error else 'SUCCESS'} email: {subject}")
-    except Exception as e:
-        logging.error(f"Email failed: {e}")
+        try:
+            server.sendmail(SENDER, recipients, msg.as_string())
+        finally:
+            server.quit()
+        logging.info(
+            "%s email sent: %s | recipients=%s",
+            "ERROR" if is_error else "SUCCESS", subject, ", ".join(recipients),
+        )
+        return True
+    except Exception as exc:
+        logging.error("Email failed: %s", exc)
+        return False
 
 
 def _count_rows_in_file(filepath):
@@ -200,6 +298,46 @@ def _get_file_size_bytes(filepath):
         return 0
 
 
+def _iter_result_artifacts(results):
+    """Yield one metadata dict for every generated delivery artifact."""
+    if not isinstance(results, dict):
+        return
+    for _channel, result in results.items():
+        if not isinstance(result, dict):
+            continue
+        artifacts = result.get("artifacts") or []
+        if artifacts:
+            for artifact in artifacts:
+                if not isinstance(artifact, dict) or not artifact.get("file"):
+                    continue
+                merged = dict(result)
+                merged.update(artifact)
+                yield merged
+        elif result.get("file"):
+            yield result
+
+
+def _derive_channel_from_filename(filename):
+    filename = str(filename or "").upper()
+    for channel in ("GREEN", "BLUE", "ARCAMAX", "ORANGE", "APPTNESS"):
+        if channel in filename:
+            return channel
+    return ""
+
+
+def _read_delivery_header(filepath, fallback=""):
+    """Read one local delivery-file header without reading the whole artifact."""
+    path = Path(filepath)
+    if path.suffix.lower() == ".zip":
+        return fallback or "ZIP archive (each inner CSV header: email)"
+    try:
+        with open(str(path), "r", errors="replace") as handle:
+            return handle.readline().strip() or fallback
+    except Exception as exc:
+        logging.warning("Unable to read delivery header from %s: %s", path, exc)
+        return fallback
+
+
 def build_file_details_json(final_files_dir, results=None):
     """
     Scan FINAL_FILES/ directory and build a list of file-detail dicts.
@@ -221,10 +359,8 @@ def build_file_details_json(final_files_dir, results=None):
 
     # Build a quick lookup: filename -> result entry
     result_by_file = {}
-    if results and isinstance(results, dict):
-        for ch, r in results.items():
-            if r and r.get('file'):
-                result_by_file[r['file']] = r
+    for result in _iter_result_artifacts(results):
+        result_by_file[result['file']] = result
 
     if final_dir.exists():
         for fp in sorted(final_dir.iterdir()):
@@ -240,15 +376,30 @@ def build_file_details_json(final_files_dir, results=None):
 
             file_size_bytes = _get_file_size_bytes(fp)
 
+            channel = result_entry.get('channel') or _derive_channel_from_filename(fname)
+            delivery_header = _read_delivery_header(
+                fp, result_entry.get("delivery_header", "")
+            )
             file_details.append({
                 "filename":        fname,
                 "file_count":      row_count,        # number of data rows
                 "row_count":       row_count,         # kept for backward compat
                 "file_size_bytes": file_size_bytes,   # raw file size in bytes
-                "channel":         result_entry.get('channel', ''),
+                "channel":         channel,
                 "merge_mode":      result_entry.get('merge_mode', ''),
                 "path":            str(fp),
+                "local_output_dir": result_entry.get("local_output_dir", ""),
+                "ftp_path":        result_entry.get("ftp_path", ""),
                 "s3_path":         result_entry.get("s3_path", ""),
+                "final_s3_path":   result_entry.get("final_s3_path", result_entry.get("s3_path", "")),
+                "complete_s3_path": result_entry.get("complete_s3_path", ""),
+                "delivery_header": delivery_header,
+                "final_data_header": result_entry.get("final_data_header", ""),
+                "complete_data_header": result_entry.get("complete_data_header", ""),
+                "final_count":     result_entry.get("final_count", row_count),
+                "complete_count":  result_entry.get("complete_count", ""),
+                "merge_source_request_id": result_entry.get("merge_source_request_id", ""),
+                "merge_source_request_name": result_entry.get("merge_source_request_name", ""),
             })
     else:
         logging.warning(f"build_file_details_json: directory not found: {final_dir}")
@@ -294,21 +445,100 @@ def _format_size_bytes(size_bytes):
         return f"{size_bytes / 1024 ** 3:.1f} GB"
 
 
-def _request_summary(request_details):
-    """Return a readable request summary for notification emails."""
+def _criteria_email_display(request_details):
+    """Render saved single or multi-criteria data consistently with the UI."""
     request_details = request_details or {}
-    fields = (
-        ("Request ID", request_details.get("id", "")),
-        ("Request Name", request_details.get("request_name", "")),
-        ("Client Name", request_details.get("client_name", "")),
-        ("Request Type", request_details.get("request_type", "")),
-        ("Criteria Type", request_details.get("criteria_type", "")),
-        ("Criteria Value", request_details.get("criteria_value", "")),
-        ("Comparison", request_details.get("comp_type", "")),
-        ("Channels", request_details.get("channel", "")),
-        ("Output Directory", request_details.get("output_dir", "")),
-    )
-    return "\n".join(f"{label}: {value or '-'}" for label, value in fields)
+    raw_items = request_details.get("criteria_json")
+    try:
+        items = json.loads(raw_items) if isinstance(raw_items, str) else raw_items
+    except (TypeError, ValueError):
+        items = None
+    if not isinstance(items, list) or not items:
+        return (
+            str(request_details.get("criteria_type") or "-").upper(),
+            request_details.get("criteria_value") or "-",
+            request_details.get("comp_type") or "-",
+        )
+
+    labels = {"age": "Age", "state": "State", "zip": "ZIP", "zips": "ZIP", "gender": "Gender"}
+    comparison_labels = {
+        "greater": "Greater Than", "less": "Lesser Than", "between": "Between",
+        "include": "Include", "exclude": "Exclude",
+    }
+    value_parts, comparison_parts, criteria_labels = [], [], []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or "").lower()
+        label = labels.get(kind, kind.title() or "Criterion")
+        comparison = str(item.get("comparison") or "").lower()
+        if kind == "age" and comparison == "between":
+            value = "{0}-{1}".format(item.get("from", ""), item.get("to", ""))
+        elif kind in {"state", "gender"}:
+            values = item.get("values") or []
+            if isinstance(values, str):
+                values = [part.strip() for part in values.split(",")]
+            value = ", ".join(str(part) for part in values if str(part).strip())
+        elif kind in {"zip", "zips"}:
+            value = "Uploaded ZIP file"
+        else:
+            value = str(item.get("value") or "-")
+        criteria_labels.append(label)
+        value_parts.append("{0}: {1}".format(label, value or "-"))
+        comparison_parts.append("{0}: {1}".format(
+            label, comparison_labels.get(comparison, comparison or "-")
+        ))
+    criteria_label = "MULTI" if len(criteria_labels) > 1 else (criteria_labels[0].upper() if criteria_labels else "-")
+    return criteria_label, " | ".join(value_parts) or "-", " | ".join(comparison_parts) or "-"
+
+
+def _request_detail_rows(request_details):
+    """Return the standard notification request-details table rows."""
+    request_details = request_details or {}
+    criteria, criteria_value, comparison = _criteria_email_display(request_details)
+    responder = "Yes — last {0} day(s)".format(request_details.get("responder_days") or "-") \
+        if _is_truthy(request_details.get("responder_match")) else "No"
+    source_id = request_details.get("merge_source_request_id")
+    if source_id:
+        source_name = request_details.get("merge_source_request_name")
+        merge = "Yes — #{0}{1}".format(
+            source_id, " ({0})".format(source_name) if source_name else ""
+        )
+    else:
+        merge = "No"
+    return [
+        ("Request Name", request_details.get("request_name") or "-"),
+        ("Client Name", request_details.get("client_name") or "-"),
+        ("Request Type", request_details.get("request_type") or "-"),
+        ("Criteria", criteria),
+        ("Criteria Value", criteria_value),
+        ("Comparison", comparison),
+        ("Channels", request_details.get("channel") or "-"),
+        ("Responder Match", responder),
+        ("Merge Previous Output", merge),
+    ]
+
+
+def _request_summary(request_details):
+    return "\n".join("{0}: {1}".format(label, value) for label, value in _request_detail_rows(request_details))
+
+
+def _html_table(headers, rows):
+    """Build a compact, Outlook-safe HTML table from untrusted text values."""
+    cell_style = "border:1px solid #cbd5e1;padding:7px 9px;text-align:left;vertical-align:top;"
+    header_style = cell_style + "background:#eff6ff;color:#0f172a;font-weight:600;"
+    header_html = "".join("<th style=\"{0}\">{1}</th>".format(header_style, html.escape(str(value))) for value in headers)
+    body_html = []
+    for row in rows:
+        body_html.append("<tr>{0}</tr>".format("".join(
+            "<td style=\"{0}\">{1}</td>".format(cell_style, html.escape(str(value if value not in (None, "") else "-")))
+            for value in row
+        )))
+    return "<table style=\"border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;margin:8px 0 18px;\"><thead><tr>{0}</tr></thead><tbody>{1}</tbody></table>".format(header_html, "".join(body_html))
+
+
+def _request_details_html(request_details):
+    return _html_table(["Field", "Value"], _request_detail_rows(request_details))
 
 
 def _request_subject(status, request_details):
@@ -318,28 +548,129 @@ def _request_subject(status, request_details):
     return f"CPA Tool {status} | Request: {request_name} | ID: {request_id}"
 
 
-def _latest_log_details(run_dir, max_chars=20000):
-    """Return the latest request log contents for an error notification."""
+def _latest_log_path(run_dir):
+    """Return the latest log location; never attach its full contents to mail."""
     if not run_dir:
-        return "No request log directory was supplied."
+        return ""
 
     logs_dir = Path(run_dir) / "logs"
     if not logs_dir.exists():
-        return f"No log directory found at: {logs_dir}"
+        return ""
 
     log_files = sorted(logs_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not log_files:
-        return f"No log files found in: {logs_dir}"
+        return ""
+    return str(log_files[0])
 
-    latest_log = log_files[0]
+
+def _short_error_reason(error_msg, max_length=360):
+    """Reduce a traceback/subprocess dump to the actionable reason only."""
+    text = str(error_msg or "Request processing failed.")
+    ignored_prefixes = ("traceback", "file ", "raise ", "during handling")
+    candidates = []
+    for line in text.splitlines():
+        cleaned = line.strip()
+        if not cleaned or cleaned.lower().startswith(ignored_prefixes):
+            continue
+        if cleaned.startswith("^"):
+            continue
+        candidates.append(cleaned)
+    reason = " ".join(candidates) if candidates else text.strip()
+    reason = " ".join(reason.split())
+    if len(reason) > max_length:
+        reason = reason[:max_length - 1].rstrip() + "…"
+    return reason or "Request processing failed."
+
+
+def _error_marker_path(run_dir):
+    if not run_dir:
+        return None
+    return Path(run_dir) / "logs" / "error_email_sent.json"
+
+
+def error_notification_sent(run_dir):
+    """Return True only when this request run already sent an error notice."""
+    marker = _error_marker_path(run_dir)
+    return bool(marker and marker.exists())
+
+
+def _write_error_marker(run_dir, subject, reason):
+    marker = _error_marker_path(run_dir)
+    if not marker:
+        return
     try:
-        with open(str(latest_log), "r", errors="replace") as log_file:
-            content = log_file.read()
-        if len(content) > max_chars:
-            content = "[Earlier log content omitted]\n" + content[-max_chars:]
-        return f"Log File: {latest_log}\n\n{content}"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(marker), "w") as handle:
+            json.dump({"subject": subject, "reason": reason, "sent_at": datetime.utcnow().isoformat()}, handle)
     except Exception as exc:
-        return f"Could not read log file {latest_log}: {exc}"
+        logging.warning("Unable to write error-email marker: %s", exc)
+
+
+def _output_detail_rows(file_details, include_private_paths):
+    """Build role-appropriate output rows for email bodies."""
+    rows = []
+    for detail in file_details:
+        merge_note = detail.get("merge_mode") or "CURRENT_ONLY"
+        if detail.get("merge_source_request_id"):
+            source_name = detail.get("merge_source_request_name") or ""
+            merge_note += " — source #{0}{1}".format(
+                detail["merge_source_request_id"],
+                " ({0})".format(source_name) if source_name else "",
+            )
+        if not include_private_paths:
+            rows.append([
+                detail.get("channel") or "-",
+                detail.get("filename") or "-",
+                detail.get("delivery_header") or "-",
+                detail.get("file_count") or 0,
+                detail.get("ftp_path") or "-",
+                merge_note,
+            ])
+            continue
+        rows.append([
+            detail.get("channel") or "-",
+            detail.get("filename") or "-",
+            detail.get("delivery_header") or "-",
+            detail.get("file_count") or 0,
+            detail.get("ftp_path") or "-",
+            detail.get("path") or detail.get("local_output_dir") or "-",
+            "{0} | header: {1} | count: {2}".format(
+                detail.get("final_s3_path") or "-",
+                detail.get("final_data_header") or "-",
+                detail.get("final_count") if detail.get("final_count") not in (None, "") else "-",
+            ),
+            "{0} | header: {1} | count: {2}".format(
+                detail.get("complete_s3_path") or "-",
+                detail.get("complete_data_header") or "-",
+                detail.get("complete_count") if detail.get("complete_count") not in (None, "") else "-",
+            ),
+            merge_note,
+        ])
+    return rows
+
+
+def _output_details_html(file_details, include_private_paths):
+    rows = _output_detail_rows(file_details, include_private_paths)
+    if not rows:
+        return "<p>No delivery file was generated because no matching data was returned.</p>"
+    if include_private_paths:
+        headers = [
+            "Channel", "File", "Delivery Header", "Final Count", "FTP Path",
+            "Local Output", "Final Data (S3)", "Complete Data (S3)", "Merge",
+        ]
+    else:
+        headers = ["Channel", "File", "Header", "Final Count", "FTP Path", "Merge"]
+    return _html_table(headers, rows)
+
+
+def _output_details_text(file_details, include_private_paths):
+    rows = _output_detail_rows(file_details, include_private_paths)
+    if not rows:
+        return "No delivery file was generated because no matching data was returned."
+    lines = []
+    for row in rows:
+        lines.append(" | ".join(str(value) for value in row))
+    return "\n".join(lines)
 
 
 def send_success_email(request_details, results, run_dir):
@@ -388,55 +719,95 @@ def send_success_email(request_details, results, run_dir):
     # ── 3. Read back from JSON file for email body ─────────────
     email_file_details = _read_filedetails_json(json_path) if json_path.exists() else file_details
 
-    # ── 4. Build email body ────────────────────────────────────
-    if email_file_details:
-        lines = []
-        for fd in email_file_details:
-            ch_tag     = f"[{fd['channel']}] " if fd.get('channel') else ""
-            merge_note = "  |  Merged with previous request" if fd.get('merge_mode') == 'MERGED' else "  |  Current output"
-            row_count  = fd.get('file_count', fd.get('row_count', 0)) or 0
-            size_bytes = fd.get('file_size_bytes', 0) or 0
-            size_str   = _format_size_bytes(size_bytes)
-            lines.append(
-                f"  . {ch_tag}{fd['filename']}"
-                f"  |  Rows: {row_count:,}"
-                f"  |  Size: {size_str}"
-                f"  |  Raw bytes: {size_bytes:,}"
-                f"{merge_note}"
-            )
-        file_section = "\n".join(lines)
-    else:
-        file_section = "(no files found in FINAL_FILES directory)"
-
+    # ── 4. Build role-aware text and HTML messages ──────────────
+    cpa_view = _is_cpa_user(request_details)
+    include_private_paths = not cpa_view
+    file_section = _output_details_text(email_file_details, include_private_paths)
+    output_html = _output_details_html(email_file_details, include_private_paths)
     subject = _request_subject("COMPLETED", request_details)
-    body = f"""SUCCESS: Request completed successfully
+    private_note = (
+        "The Final Data S3 export is delivery data. The Complete Data S3 export is audit data and includes ZIP/account fields by design."
+        if include_private_paths else
+        "This recipient view intentionally excludes local and S3 paths; use the FTP path to retrieve the delivery file."
+    )
+    body = """SUCCESS: Request completed successfully
 
 Request Details:
-{_request_summary(request_details)}
+{summary}
 
-Output Directory: {final_files_dir}
+Generated Output Details:
+{files}
 
-Generated files:
-{file_section}
-
-Processing completed successfully!"""
-
-    send_email(subject, body, is_error=False)
+{note}
+""".format(summary=_request_summary(request_details), files=file_section, note=private_note)
+    html_body = """<html><body style=\"font-family:Arial,sans-serif;color:#111827;\">
+<p><strong>SUCCESS:</strong> Request completed successfully.</p>
+<h3>Request Details</h3>{request_table}
+<h3>Generated Output Details</h3>{output_table}
+<p>{note}</p>
+</body></html>""".format(
+        request_table=_request_details_html(request_details),
+        output_table=output_html,
+        note=html.escape(private_note),
+    )
+    send_email(
+        subject, body, is_error=False, html_body=html_body,
+        recipients=_notification_recipients(request_details, is_error=False),
+    )
     # Return both so callers that need the data or path can use them
     return file_details, json_path
 
 
-def send_error_email(request_details, error_msg, run_dir=None):
-    """Send an error email with request metadata, error details, and log output."""
+def send_error_email(request_details, error_msg, run_dir=None, results=None):
+    """Send a concise, deduplicated failure email with request context."""
     subject = _request_subject("FAILED", request_details)
-    body = f"""ERROR: Request failed
+    reason = _short_error_reason(error_msg)
+    log_path = _latest_log_path(run_dir)
+    final_files_dir = Path(run_dir) / "FINAL_FILES" if run_dir else None
+    file_details = (
+        build_file_details_json(final_files_dir, results)
+        if final_files_dir and final_files_dir.exists() else []
+    )
+    cpa_view = _is_cpa_user(request_details)
+    include_private_paths = not cpa_view
+    output_text = (
+        _output_details_text(file_details, include_private_paths)
+        if file_details else "No completed delivery artifact was available."
+    )
+    body = """ERROR: Request failed
 
 Request Details:
-{_request_summary(request_details)}
+{summary}
 
-Error Details:
-{error_msg}
+Exit reason:
+{reason}
 
-Error Log Details:
-{_latest_log_details(run_dir)}"""
-    send_email(subject, body, is_error=True)
+Available Output Details:
+{output_details}
+{log_line}
+""".format(
+        summary=_request_summary(request_details), reason=reason,
+        output_details=output_text,
+        log_line=("\nSupport log: {0}".format(log_path)
+                  if log_path and include_private_paths else ""),
+    )
+    html_body = """<html><body style=\"font-family:Arial,sans-serif;color:#111827;\">
+<p><strong style=\"color:#b91c1c;\">ERROR:</strong> Request failed.</p>
+<h3>Request Details</h3>{request_table}
+<h3>Exit Reason</h3><p>{reason}</p>
+<h3>Available Output Details</h3>{output_table}
+{log_line}
+</body></html>""".format(
+        request_table=_request_details_html(request_details),
+        reason=html.escape(reason),
+        output_table=_output_details_html(file_details, include_private_paths),
+        log_line=("<p><strong>Support log:</strong> {0}</p>".format(html.escape(log_path))
+                  if log_path and include_private_paths else ""),
+    )
+    sent = send_email(
+        subject, body, is_error=True, html_body=html_body,
+        recipients=_notification_recipients(request_details, is_error=True),
+    )
+    if sent:
+        _write_error_marker(run_dir, subject, reason)
+    return sent

@@ -60,12 +60,14 @@ import json
 import os
 import re
 import time
+import gzip
 import shutil
 import logging
 import pymysql
 import subprocess
 import shlex
 import pandas as pd
+from itertools import chain
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -245,25 +247,23 @@ def get_db_with_retry(log=None):
 
 
 def fetch_request_details(request_id):
+    """Fetch complete notification/processing metadata for all workflows."""
     conn = get_db_with_retry()
     try:
         with conn.cursor(pymysql.cursors.DictCursor) as cur:
             cur.execute(
                 """
-                SELECT
-                    id,
-                    client_name,
-                    request_type,
-                    request_name,
-                    criteria_type,
-                    criteria_value,
-                    comp_type,
-                    output_dir,
-                    responder_match,
-                    responder_days,
-                    merge_source_request_id
-                FROM requests
-                WHERE id=%s
+                SELECT r.id, r.client_name, r.request_type, r.request_name,
+                       r.criteria_type, r.criteria_value, r.comp_type,
+                       r.criteria_json, r.channel, r.output_dir,
+                       r.responder_match, r.responder_days,
+                       r.merge_source_request_id,
+                       u.username,
+                       source.request_name AS merge_source_request_name
+                  FROM requests r
+                  JOIN users u ON u.id=r.created_by
+             LEFT JOIN requests source ON source.id=r.merge_source_request_id
+                 WHERE r.id=%s
                 """,
                 (request_id,),
             )
@@ -671,26 +671,31 @@ def _insert_into_perm_table(
     return inserted_rows
 
 
-def _export_complete_final_file(export_type, perm_table, export_path, channel_name, log):
+def _export_complete_final_file(export_type, perm_table, export_path, channel_name,
+                                log, include_gender=False):
     """
     Export FINAL / COMPLETE file from permanent table -> S3 path.
     FINAL   : DISTINCT email (GREEN/BLUE/ARCAMAX)  |  DISTINCT email_address, account_name (ORANGE)
     COMPLETE: email, ZIP     (GREEN/BLUE/ARCAMAX)  |  email_address, ZIP, account_name      (ORANGE)
+
+    ``include_gender`` is used only by the consolidated Gender workflow.  It
+    retains the selected record's gender long enough to create separate Male
+    and Female delivery files, while leaving standard Age/State/ZIP exports
+    unchanged.
     """
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
 
+    channel_name = str(channel_name).upper()
     if export_type == "FINAL":
-        select_clause = (
-            "DISTINCT email_address, account_name"
-            if channel_name == "ORANGE"
-            else "DISTINCT email"
-        )
+        if channel_name == "ORANGE":
+            select_clause = "DISTINCT email_address, account_name" + (", gender" if include_gender else "")
+        else:
+            select_clause = "DISTINCT email" + (", gender" if include_gender else "")
     else:  # COMPLETE
-        select_clause = (
-            "email_address, ZIP, account_name"
-            if channel_name == "ORANGE"
-            else "email, ZIP"
-        )
+        if channel_name == "ORANGE":
+            select_clause = "email_address, ZIP, account_name" + (", gender" if include_gender else "")
+        else:
+            select_clause = "email, ZIP" + (", gender" if include_gender else "")
 
     sql = (
         f"COPY INTO '{export_path}/' "
@@ -718,6 +723,7 @@ def _export_complete_final_file(export_type, perm_table, export_path, channel_na
         log.info(f"  Rows unloaded to {export_type} S3 path: {unloaded_rows:,}")
     else:
         log.warning(f"  Could not verify {export_type} FILE S3 row count (non-fatal)")
+    return unloaded_rows
 
 
 def _drop_perm_table(perm_table, log):
@@ -732,26 +738,26 @@ def _drop_perm_table(perm_table, log):
 # ── Download + combine helper ─────────────────────────────────────────────────
 
 def _download_and_combine(s3_path, download_dir, work_dir,
-                           output_file, channel_name, log):
+                           output_file, channel_name, log, include_gender=False):
     """
-    Download gzipped S3 parts and concatenate into one pipe-delimited file.
-    ORANGE: keep all columns.  Others: keep col-1 (email) only.
-    Header row (written by Snowflake COPY INTO HEADER=TRUE) is stripped.
-
-    FIX: Snowflake COPY INTO COMPRESSION=GZIP produces part files named
-         data_0_0_0.csv.gz  (or similar).  The previous glob('data*') only
-         matched files starting with 'data' which works BUT aws s3 cp
-         --recursive downloads the files preserving the prefix structure.
-         The real bug was that s3_path had NO trailing slash, causing
-         aws s3 cp to treat it as a single object copy (not a prefix copy)
-         and writing a single file named 'ORANGE_FINAL' with no extension
-         instead of the .gz parts inside the prefix — so glob('*.gz')
-         found nothing.  Fix: always append trailing slash to s3_path and
-         glob for '*.gz' to match Snowflake GZIP part files regardless of
-         naming scheme.
+    Download Snowflake part files and stream them into one pipe-delimited
+    output.  Snowflake writes a header in *every* part.  The old shell pipeline
+    removed only the first global header, so multi-part files contained extra
+    header rows and the stored final count was too high.  This stream-based
+    implementation skips each part header without ever loading the data set
+    into memory.
     """
     download_dir = Path(download_dir)
-    work_dir     = Path(work_dir)
+    work_dir = Path(work_dir)
+    channel_name = str(channel_name).upper()
+    if channel_name == "ORANGE":
+        output_header = ["email_address", "account_name"]
+    else:
+        output_header = ["email"]
+    if include_gender:
+        output_header.append("gender")
+
+    shutil.rmtree(str(download_dir), ignore_errors=True)
     download_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -786,32 +792,50 @@ def _download_and_combine(s3_path, download_dir, work_dir,
                size_bytes=part.stat().st_size)
 
     out_path = work_dir / output_file
-
-    if channel_name != "ORANGE":
-        run_command(
-            f"printf 'email\\n' > {shlex.quote(str(out_path))} && "
-            f"zcat {shlex.quote(str(download_dir) + '/')}*.gz "
-            f"| sed 's/\\\"//g' | tail -n +2 | cut -d'|' -f1 >> {shlex.quote(str(out_path))}"
-        )
-    else:
-        run_command(
-            f"printf 'email|account_name\\n' > {shlex.quote(str(out_path))} && "
-            f"zcat {shlex.quote(str(download_dir) + '/')}*.gz "
-            f"| sed 's/\\\"//g' | tail -n +2 >> {shlex.quote(str(out_path))}"
-        )
-
-    # Clean up downloaded gz parts
-    for f in downloaded:
-        try:
-            f.unlink()
-        except Exception:
-            pass
+    data_count = 0
+    try:
+        with open(str(out_path), "w", newline="") as destination:
+            writer = csv.writer(destination, delimiter="|", lineterminator="\n")
+            writer.writerow(output_header)
+            for part in downloaded:
+                part_count = 0
+                opener = gzip.open if part.suffix.lower() == ".gz" else open
+                with opener(str(part), "rt", newline="") as source:
+                    reader = csv.reader(source, delimiter="|")
+                    first_row = next(reader, None)
+                    expected = [column.lower() for column in output_header]
+                    if first_row:
+                        actual = [str(value).strip().lower() for value in first_row]
+                        # The expected Snowflake header must be skipped for
+                        # every part.  If a non-standard unheadered file is
+                        # received, preserve its first data row instead.
+                        if actual[:len(expected)] != expected:
+                            reader = chain((first_row,), reader)
+                    for row in reader:
+                        if not row:
+                            continue
+                        values = [str(row[index]).strip() if len(row) > index else ""
+                                  for index in range(len(output_header))]
+                        if not values[0]:
+                            continue
+                        writer.writerow(values)
+                        data_count += 1
+                        part_count += 1
+                _trace(log, "S3 part combined", part=part.name,
+                       data_rows=part_count, header_skipped=True)
+    finally:
+        for path in downloaded:
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
     _verify_local_file(log, "combined download", out_path)
-    combined_count = _count_file_lines(str(out_path))
+    combined_count = data_count + 1  # delivery file header + data rows
     _trace(log, "combined download validation", output=out_path,
-           line_count=combined_count, channel=channel_name)
-    log.info(f"  Combined file written: {out_path}  |  rows: {combined_count:,}")
+           line_count=combined_count, data_rows=data_count,
+           channel=channel_name, header="|".join(output_header))
+    log.info(f"  Combined file written: {out_path}  |  data rows: {data_count:,}")
     return combined_count
 
 
@@ -1701,9 +1725,11 @@ def _fetch_consolidated_request(request_id):
                        r.criteria_type, r.comp_type, r.criteria_value,
                        r.criteria_json, r.zip_file_path, r.channel,
                        r.output_dir, r.merge_source_request_id,
-                       r.responder_match, r.responder_days, u.username
+                       r.responder_match, r.responder_days, u.username,
+                       source.request_name AS merge_source_request_name
                   FROM requests r
                   JOIN users u ON u.id = r.created_by
+             LEFT JOIN requests source ON source.id = r.merge_source_request_id
                  WHERE r.id=%s
                 """,
                 (request_id,),
@@ -1850,9 +1876,26 @@ def _criteria_predicate(channel, criteria, zip_staging_table, log):
         elif item_type in ("state", "gender"):
             values = [value.replace("'", "''") for value in item["values"]]
             operator = "IN" if comparison == "include" else "NOT IN"
+            if item_type == "gender":
+                # The request form accepts M/F, while source systems can use
+                # either M/F or MALE/FEMALE.  Match both representations and
+                # normalise the final output name separately.
+                expanded_values = []
+                for value in values:
+                    normalised = _gender_label(value)
+                    if normalised == "MALE":
+                        expanded_values.extend(["M", "MALE"])
+                    elif normalised == "FEMALE":
+                        expanded_values.extend(["F", "FEMALE"])
+                    else:
+                        expanded_values.append(value)
+                values = list(dict.fromkeys(expanded_values))
+                column = "UPPER(TRIM({0}))".format(columns[item_type])
+            else:
+                column = columns[item_type]
             conditions.append(
                 "{0} {1} ({2})".format(
-                    columns[item_type], operator,
+                    column, operator,
                     ",".join("'{0}'".format(value) for value in values)
                 )
             )
@@ -1873,14 +1916,51 @@ def _criteria_predicate(channel, criteria, zip_staging_table, log):
     return predicate
 
 
+def _gender_label(value):
+    """Return the delivery filename label for a saved gender value."""
+    cleaned = str(value or "").strip().upper()
+    if cleaned in ("M", "MALE"):
+        return "MALE"
+    if cleaned in ("F", "FEMALE"):
+        return "FEMALE"
+    return cleaned
+
+
+def _gender_delivery_labels(criteria, request_type):
+    """Return requested Gender labels for split Suppression output only."""
+    if str(request_type).lower() != "suppression":
+        return []
+    labels = []
+    for item in criteria:
+        if item.get("type") != "gender" or item.get("comparison") != "include":
+            continue
+        for value in item.get("values") or []:
+            label = _gender_label(value)
+            if label and label not in labels:
+                labels.append(label)
+    return labels
+
+
+def _gender_select_expression(channel):
+    """Create one stable MALE/FEMALE-compatible SQL output column."""
+    column = _column_map(channel)["gender"]
+    return (
+        "CASE UPPER(TRIM(COALESCE({0}, ''))) "
+        "WHEN 'M' THEN 'MALE' WHEN 'MALE' THEN 'MALE' "
+        "WHEN 'F' THEN 'FEMALE' WHEN 'FEMALE' THEN 'FEMALE' "
+        "ELSE UPPER(TRIM(COALESCE({0}, ''))) END AS gender"
+    ).format(column)
+
+
 def _create_criteria_channel_table(perm_table, channel, criteria,
                                    zip_staging_table, responder_match,
-                                   responder_days, log):
+                                   responder_days, log, include_gender=False):
     """Create one channel's standardised table for any supported criteria set."""
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
     channel = str(channel).upper()
     predicate = _criteria_predicate(channel, criteria, zip_staging_table, log)
     responder_join = _responder_join(channel, responder_match, responder_days)
+    gender_select = ", " + _gender_select_expression(channel) if include_gender else ""
     if channel in ("GREEN", "BLUE"):
         profile_table = (
             "GREEN_LPT.UNIVERSAL_PROFILE" if channel == "GREEN"
@@ -1888,21 +1968,22 @@ def _create_criteria_channel_table(perm_table, channel, criteria,
         )
         sql = (
             "CREATE OR REPLACE TABLE {perm} AS "
-            "SELECT a.email, b.ZIP FROM {profile} a "
+            "SELECT a.email, b.ZIP{gender_select} FROM {profile} a "
             "JOIN APT_CUSTOM_GREEN_REA_DATA_DND b ON a.md5hash=b.EMAIL_MD5 "
             "{responder_join}WHERE {predicate};"
         ).format(perm=perm_table, profile=profile_table,
-                 responder_join=responder_join, predicate=predicate)
+                 responder_join=responder_join, predicate=predicate,
+                 gender_select=gender_select)
     elif channel == "ARCAMAX":
         sql = (
             "CREATE OR REPLACE TABLE {perm} AS "
-            "SELECT email, ZIP FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
+            "SELECT email, ZIP{gender_select} FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
             "WHERE {predicate};"
-        ).format(perm=perm_table, predicate=predicate)
+        ).format(perm=perm_table, predicate=predicate, gender_select=gender_select)
     else:
         sql = (
             "CREATE OR REPLACE TABLE {perm} AS "
-            "SELECT a.email_address, a.ZIP, esp.ACCOUNT_NAME "
+            "SELECT a.email_address, a.ZIP, esp.ACCOUNT_NAME{gender_select} "
             "FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a "
             "JOIN APT_ADHOC_JAIDEEP_ZIP_ESP_DETAILS_INCLUDE_ORANGE_20260604 esp "
             "ON a.FEED_ID=esp.FEEDID "
@@ -1912,10 +1993,11 @@ def _create_criteria_channel_table(perm_table, channel, criteria,
             "QUALIFY ROW_NUMBER() OVER (PARTITION BY a.email_address "
             "ORDER BY a.created_at DESC)=1;"
         ).format(perm=perm_table, responder_join=responder_join,
-                 predicate=predicate)
+                 predicate=predicate, gender_select=gender_select)
     _trace(log, "Snowflake criteria table creation", channel=channel,
            target_table=perm_table, responder_match=bool(responder_match),
            responder_days=(responder_days if responder_match else "not enabled"),
+           gender_output_enabled=include_gender,
            sql=_safe_sql_for_log(sql))
     run_command(["snowsql", "-c", "datateam1", "-q", sql])
     count = _query_snowflake("SELECT COUNT(*) FROM {0}".format(perm_table), log)
@@ -1986,6 +2068,9 @@ def _write_orange_delivery(raw_file, context, request_type, log):
             record_count = 0
             with open(str(final_file), "w", newline="") as destination:
                 writer = csv.writer(destination, lineterminator="\n")
+                # Account/ESP is routing metadata only.  The delivered
+                # suppression file always has the requested email header.
+                writer.writerow(["email"])
                 for row in reader:
                     email = str(row.get(email_column) or "").strip()
                     if not email:
@@ -2018,7 +2103,11 @@ def _write_orange_delivery(raw_file, context, request_type, log):
                     )
                     output = esp_dir / filename
                     handle = open(str(output), "w", newline="")
-                    open_outputs[account] = (output, handle, csv.writer(handle, lineterminator="\n"))
+                    writer = csv.writer(handle, lineterminator="\n")
+                    # Every inner ESP file is a delivery list, never the raw
+                    # email/account S3 audit export.
+                    writer.writerow(["email"])
+                    open_outputs[account] = (output, handle, writer)
                     counts[account] = 0
                 output, handle, writer = open_outputs[account]
                 del output, handle
@@ -2047,6 +2136,77 @@ def _write_orange_delivery(raw_file, context, request_type, log):
     return archive_name, archive_file, record_count
 
 
+def _write_gender_suppression_delivery(raw_file, context, channel, gender_labels, log):
+    """Split a Gender Suppression extract into one email-only file per gender.
+
+    The raw FINAL S3 export includes gender only for this workflow.  It is
+    streamed once and no raw email/account/ZIP audit column is copied into a
+    delivery file.  The requested filenames match the established format:
+    ``Gender_Suppression_MALE_GREEN_YYYYMMDD.csv``.
+    """
+    raw_file = Path(raw_file)
+    final_dir = context["final_files_dir"]
+    channel = str(channel).upper()
+    _verify_local_file(log, "Gender raw output", raw_file)
+    writers = {}
+    counts = {}
+    artifacts = []
+    try:
+        with open(str(raw_file), "r", newline="") as source:
+            reader = csv.DictReader(source, delimiter="|")
+            fieldnames = reader.fieldnames or []
+            email_column = "email_address" if "email_address" in fieldnames else "email"
+            if email_column not in fieldnames or "gender" not in fieldnames:
+                raise RuntimeError(
+                    "Gender delivery requires FINAL data with email and gender columns."
+                )
+            _trace(log, "Gender delivery header validated", channel=channel,
+                   raw_file=raw_file, email_column=email_column,
+                   gender_labels=",".join(gender_labels))
+            for label in gender_labels:
+                filename = "Gender_Suppression_{0}_{1}_{2}.csv".format(
+                    label, channel, context["path_date"]
+                )
+                output = final_dir / filename
+                handle = open(str(output), "w", newline="")
+                writer = csv.writer(handle, lineterminator="\n")
+                writer.writerow(["email"])
+                writers[label] = (output, handle, writer)
+                counts[label] = 0
+
+            for row in reader:
+                label = _gender_label(row.get("gender"))
+                if label not in writers:
+                    continue
+                email = str(row.get(email_column) or "").strip()
+                if not email:
+                    continue
+                writers[label][2].writerow([email])
+                counts[label] += 1
+    finally:
+        for output, handle, writer in writers.values():
+            del output, writer
+            handle.close()
+
+    for label in gender_labels:
+        output = writers[label][0]
+        count = counts[label]
+        _verify_local_file(log, "Gender {0} delivery".format(label), output)
+        _trace(log, "Gender suppression delivery created", channel=channel,
+               gender=label, filename=output.name, row_count=count)
+        artifacts.append({
+            "channel": channel,
+            "file": output.name,
+            "final_file_path": str(output),
+            "count": count,
+            "delivery_header": "email",
+            "gender": label,
+        })
+    if not artifacts:
+        raise RuntimeError("No Gender delivery artifacts were created.")
+    return artifacts
+
+
 def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir, channel):
     """Run one complete non-DoorDash channel using the common criteria engine."""
     channel = str(channel).upper()
@@ -2055,18 +2215,30 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
     log = setup_processor_channel_logging(run_dir, channel)
     started = time.time()
     table_created = False
+    gender_labels = _gender_delivery_labels(criteria, request_data["request_type"])
+    include_gender = bool(gender_labels)
+    final_data_header = (
+        "email_address|account_name" if channel == "ORANGE" else "email"
+    ) + ("|gender" if include_gender else "")
+    complete_data_header = (
+        "email_address|ZIP|account_name" if channel == "ORANGE" else "email|ZIP"
+    ) + ("|gender" if include_gender else "")
     _trace(log, "consolidated channel start", request_id=request_id, channel=channel,
            criteria_json=json.dumps(criteria, sort_keys=True),
            zip_staging_table=(zip_staging_table or "not used"),
            merge_source_request_id=(request_data.get("merge_source_request_id") or "NULL"),
-           final_s3=context["path_FINAL"], complete_s3=context["path_COMPLETE"])
+           final_s3=context["path_FINAL"], complete_s3=context["path_COMPLETE"],
+           gender_split_labels=",".join(gender_labels) or "not enabled",
+           final_data_header=final_data_header,
+           complete_data_header=complete_data_header)
     try:
         update_request_status(request_id, "Started", channel + "_STATUS", log)
         _step(log, 1, 9, "Creating Snowflake criteria table", channel)
         update_request_status(request_id, "Loading to Snowflake", channel + "_STATUS", log)
         count = _create_criteria_channel_table(
             context["perm_table"], channel, criteria, zip_staging_table,
-            request_data.get("responder_match"), request_data.get("responder_days"), log
+            request_data.get("responder_match"), request_data.get("responder_days"), log,
+            include_gender=include_gender,
         )
         table_created = True
         if count == 0:
@@ -2078,10 +2250,16 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
 
         _step(log, 2, 9, "Exporting final data to S3", channel)
         update_request_status(request_id, "Exporting Final File", channel + "_STATUS", log)
-        _export_complete_final_file("FINAL", context["perm_table"], context["path_FINAL"], channel, log)
+        final_export_count = _export_complete_final_file(
+            "FINAL", context["perm_table"], context["path_FINAL"], channel, log,
+            include_gender=include_gender,
+        )
         _step(log, 3, 9, "Exporting complete audit data to S3", channel)
         update_request_status(request_id, "Exporting Complete File", channel + "_STATUS", log)
-        _export_complete_final_file("COMPLETE", context["perm_table"], context["path_COMPLETE"], channel, log)
+        complete_export_count = _export_complete_final_file(
+            "COMPLETE", context["perm_table"], context["path_COMPLETE"], channel, log,
+            include_gender=include_gender,
+        )
 
         _step(log, 4, 9, "Dropping validated Snowflake table", channel)
         _drop_perm_table(context["perm_table"], log)
@@ -2092,7 +2270,8 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
         raw_file = context["channel_tmp"] / context["output_file"]
         _download_and_combine(
             context["path_FINAL"], context["channel_tmp"] / "download",
-            context["channel_tmp"], context["output_file"], channel, log
+            context["channel_tmp"], context["output_file"], channel, log,
+            include_gender=include_gender,
         )
         _verify_local_file(log, "combined current output", raw_file)
 
@@ -2100,7 +2279,8 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
         if request_data.get("merge_source_request_id"):
             merge_result = merge_current_file(
                 request_id, request_data["merge_source_request_id"], channel,
-                raw_file, context["path_FINAL"], context["channel_tmp"], log
+                raw_file, context["path_FINAL"], context["channel_tmp"], log,
+                preserve_gender=include_gender,
             )
             count = merge_result["count"]
             merge_mode = merge_result["merge_mode"]
@@ -2114,37 +2294,99 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
                    reason="merge_source_request_id is NULL", row_count=count)
 
         _step(log, 7, 9, "Building current request delivery artifact", channel)
-        if channel == "ORANGE":
+        if include_gender:
+            artifacts = _write_gender_suppression_delivery(
+                raw_file, context, channel, gender_labels, log
+            )
+            delivery_count = sum(item["count"] for item in artifacts)
+            if delivery_count != count:
+                raise RuntimeError(
+                    "Gender delivery count ({0}) does not match FINAL count ({1}); "
+                    "a merge source without retained gender values cannot be split safely."
+                    .format(delivery_count, count)
+                )
+        elif channel == "ORANGE":
             output_name, final_file, count = _write_orange_delivery(
                 raw_file, context, request_data["request_type"], log
             )
+            artifacts = [{
+                "channel": channel, "file": output_name,
+                "final_file_path": str(final_file), "count": count,
+                "delivery_header": (
+                    "email" if str(request_data["request_type"]).lower() == "suppression"
+                    else "ZIP archive (each ESP CSV header: email)"
+                ),
+            }]
+            delivery_count = count
         else:
             output_name = context["output_file"]
             final_file = context["final_files_dir"] / output_name
             shutil.move(str(raw_file), str(final_file))
             _verify_local_file(log, "final delivery file", final_file)
+            artifacts = [{
+                "channel": channel, "file": output_name,
+                "final_file_path": str(final_file), "count": count,
+                "delivery_header": "email",
+            }]
+            delivery_count = count
 
         _step(log, 8, 9, "Persisting output details", channel)
         if merge_mode == "CURRENT_ONLY":
-            update_channel_storage(request_id, channel, output_s3, count, log)
+            update_channel_storage(request_id, channel, output_s3, delivery_count, log)
         update_request_status(request_id, "Posting To FTP", channel + "_STATUS", log)
 
         _step(log, 9, 9, "Posting delivery artifact to FTP", channel)
-        ftp_path = _post_to_ftp(
-            context["final_files_dir"], context["path_date"], output_name, log,
-            request_type=request_data["request_type"],
-        )
-        update_ftp_path(request_id, channel, ftp_path, log, count)
+        ftp_paths = []
+        for artifact in artifacts:
+            artifact_ftp_path = _post_to_ftp(
+                context["final_files_dir"], context["path_date"], artifact["file"], log,
+                request_type=request_data["request_type"],
+            )
+            artifact["ftp_path"] = artifact_ftp_path
+            ftp_paths.append(artifact_ftp_path)
+            _trace(log, "delivery artifact posted", channel=channel,
+                   filename=artifact["file"], ftp_path=artifact_ftp_path,
+                   row_count=artifact["count"])
+        ftp_path = " | ".join(ftp_paths)
+        update_ftp_path(request_id, channel, ftp_path, log, delivery_count)
         update_request_status(request_id, "Completed", channel + "_STATUS", log)
         elapsed = time.time() - started
+        common_artifact_metadata = {
+            "merge_mode": merge_mode,
+            "merge_source_request_id": request_data.get("merge_source_request_id") or "",
+            "merge_source_request_name": request_data.get("merge_source_request_name") or "",
+            "s3_path": output_s3,
+            "final_s3_path": output_s3,
+            "complete_s3_path": context["path_COMPLETE"],
+            "final_data_header": final_data_header,
+            "complete_data_header": complete_data_header,
+            "final_count": delivery_count,
+            "complete_count": complete_export_count if complete_export_count >= 0 else "",
+            "local_output_dir": str(context["final_files_dir"]),
+        }
+        for artifact in artifacts:
+            artifact.update(common_artifact_metadata)
         _trace(log, "consolidated channel completed", channel=channel,
-               row_count=count, merge_mode=merge_mode, s3_path=output_s3,
-               ftp_path=ftp_path, final_file=final_file,
+               row_count=delivery_count, final_export_count=final_export_count,
+               complete_export_count=complete_export_count, merge_mode=merge_mode,
+               s3_path=output_s3, ftp_path=ftp_path,
+               final_files=",".join(item["file"] for item in artifacts),
                elapsed_seconds="{0:.2f}".format(elapsed))
-        return {"channel": channel, "status": "SUCCESS", "count": count,
-                "file": output_name, "final_file_path": str(final_file),
+        first_artifact = artifacts[0]
+        return {"channel": channel, "status": "SUCCESS", "count": delivery_count,
+                "file": first_artifact["file"],
+                "final_file_path": first_artifact["final_file_path"],
                 "ftp_path": ftp_path, "s3_path": output_s3,
-                "merge_mode": merge_mode, "elapsed": elapsed}
+                "final_s3_path": output_s3,
+                "complete_s3_path": context["path_COMPLETE"],
+                "final_data_header": final_data_header,
+                "complete_data_header": complete_data_header,
+                "final_count": delivery_count,
+                "complete_count": complete_export_count if complete_export_count >= 0 else "",
+                "merge_source_request_id": request_data.get("merge_source_request_id") or "",
+                "merge_source_request_name": request_data.get("merge_source_request_name") or "",
+                "merge_mode": merge_mode, "artifacts": artifacts,
+                "elapsed": elapsed}
     except Exception as exc:
         if table_created:
             try:
@@ -2253,7 +2495,7 @@ def process_request(request_id, channel, output_dir=None, zip_file=None):
         if errors:
             _set_request_overall_status(request_id, "failed", log)
             message = "; ".join(errors)
-            send_error_email(request_data, message, run_dir)
+            send_error_email(request_data, message, run_dir, results=results)
             raise RuntimeError("Request failed for channel(s): " + message)
         _set_request_overall_status(request_id, "completed", log)
         send_success_email(request_data, results, run_dir)

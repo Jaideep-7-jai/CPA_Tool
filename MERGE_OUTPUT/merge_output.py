@@ -206,7 +206,8 @@ def _row_count(file_path, log=None):
     return count
 
 
-def _snowflake_merge(previous_s3, current_s3, merged_s3, channel, request_id, log):
+def _snowflake_merge(previous_s3, current_s3, merged_s3, channel, request_id,
+                     log, preserve_gender=False):
     """Merge two S3 exports in Snowflake and write a deduplicated export.
 
     The whole script must be one SnowSQL call: temporary stages and the
@@ -220,12 +221,28 @@ def _snowflake_merge(previous_s3, current_s3, merged_s3, channel, request_id, lo
     previous_stage = "CPA_MERGE_PREVIOUS_{0}".format(merge_token)
     current_stage = "CPA_MERGE_CURRENT_{0}".format(merge_token)
     merge_table = "CPA_MERGE_DATA_{0}".format(merge_token)
-    output_columns = "email, account_name" if channel == "ORANGE" else "email"
+    if channel == "ORANGE":
+        output_columns = "email, account_name" + (", gender" if preserve_gender else "")
+        staged_previous = "SELECT $1::VARCHAR, $2::VARCHAR, {0}, 1".format(
+            "$3::VARCHAR" if preserve_gender else "NULL::VARCHAR"
+        )
+        staged_current = "SELECT $1::VARCHAR, $2::VARCHAR, {0}, 2".format(
+            "$3::VARCHAR" if preserve_gender else "NULL::VARCHAR"
+        )
+    else:
+        output_columns = "email" + (", gender" if preserve_gender else "")
+        staged_previous = "SELECT $1::VARCHAR, NULL::VARCHAR, {0}, 1".format(
+            "$2::VARCHAR" if preserve_gender else "NULL::VARCHAR"
+        )
+        staged_current = "SELECT $1::VARCHAR, NULL::VARCHAR, {0}, 2".format(
+            "$2::VARCHAR" if preserve_gender else "NULL::VARCHAR"
+        )
     _trace(
         log, "Snowflake merge plan", request_id=request_id, channel=channel,
         previous_s3=_s3_prefix(previous_s3), current_s3=_s3_prefix(current_s3),
         merged_s3=_s3_prefix(merged_s3), output_columns=output_columns,
         dedupe_rule="LOWER(TRIM(email)); previous source wins",
+        preserve_gender=preserve_gender,
         previous_stage=previous_stage, current_stage=current_stage,
         temporary_table=merge_table,
     )
@@ -252,18 +269,19 @@ CREATE OR REPLACE TEMPORARY STAGE {current_stage}
 CREATE OR REPLACE TEMPORARY TABLE {merge_table} (
   email VARCHAR,
   account_name VARCHAR,
+  gender VARCHAR,
   source_order NUMBER
 );
-COPY INTO {merge_table} (email, account_name, source_order)
+COPY INTO {merge_table} (email, account_name, gender, source_order)
 FROM (
-  SELECT $1::VARCHAR, $2::VARCHAR, 1
+  {staged_previous}
   FROM @{previous_stage}
 )
 {load_format}
 ON_ERROR='ABORT_STATEMENT';
-COPY INTO {merge_table} (email, account_name, source_order)
+COPY INTO {merge_table} (email, account_name, gender, source_order)
 FROM (
-  SELECT $1::VARCHAR, $2::VARCHAR, 2
+  {staged_current}
   FROM @{current_stage}
 )
 {load_format}
@@ -274,6 +292,7 @@ FROM (
   FROM (
     SELECT email,
            account_name,
+           gender,
            ROW_NUMBER() OVER (
              PARTITION BY LOWER(TRIM(COALESCE(email, '')))
              ORDER BY source_order
@@ -298,6 +317,8 @@ MAX_FILE_SIZE=490000000;
         load_format=load_format,
         unload_format=unload_format,
         output_columns=output_columns,
+        staged_previous=staged_previous,
+        staged_current=staged_current,
     )
 
     log.info(
@@ -319,7 +340,8 @@ def _open_export_file(path):
     return open(str(path), "r", newline="")
 
 
-def _download_merged_export(merged_s3, current_file, channel, work_dir, log):
+def _download_merged_export(merged_s3, current_file, channel, work_dir, log,
+                            preserve_gender=False):
     """Stream merged S3 parts into the final local file without pandas."""
     current_file = Path(current_file)
     work_dir = Path(work_dir)
@@ -351,9 +373,12 @@ def _download_merged_export(merged_s3, current_file, channel, work_dir, log):
         with open(str(temporary_file), "w", newline="") as destination:
             writer = csv.writer(destination, delimiter="|", lineterminator="\n")
             if channel == "ORANGE":
-                writer.writerow(["email_address", "account_name"])
+                header = ["email_address", "account_name"]
             else:
-                writer.writerow(["email"])
+                header = ["email"]
+            if preserve_gender:
+                header.append("gender")
+            writer.writerow(header)
 
             for source_path in source_files:
                 part_count = 0
@@ -364,12 +389,17 @@ def _download_merged_export(merged_s3, current_file, channel, work_dir, log):
                         if not row:
                             continue
                         if channel == "ORANGE":
-                            writer.writerow([
+                            output_row = [
                                 row[0] if len(row) > 0 else "",
                                 row[1] if len(row) > 1 else "",
-                            ])
+                            ]
+                            if preserve_gender:
+                                output_row.append(row[2] if len(row) > 2 else "")
                         else:
-                            writer.writerow([row[0] if len(row) > 0 else ""])
+                            output_row = [row[0] if len(row) > 0 else ""]
+                            if preserve_gender:
+                                output_row.append(row[1] if len(row) > 1 else "")
+                        writer.writerow(output_row)
                         record_count += 1
                         part_count += 1
                 _trace(log, "merged export part streamed", part=source_path.name,
@@ -408,15 +438,20 @@ def _merged_s3_path(current_s3_prefix, current_file):
 
 
 def _merge_to_current_file(previous_s3, current_s3_prefix, current_file,
-                           channel, request_id, work_dir, log):
+                           channel, request_id, work_dir, log,
+                           preserve_gender=False):
     merged_s3 = _merged_s3_path(current_s3_prefix, current_file)
     _trace(log, "merge execution starting", request_id=request_id, channel=channel,
            previous_s3=_s3_prefix(previous_s3), current_s3=_s3_prefix(current_s3_prefix),
            merged_s3=merged_s3, local_current_file=current_file)
     _snowflake_merge(
-        previous_s3, current_s3_prefix, merged_s3, channel, request_id, log
+        previous_s3, current_s3_prefix, merged_s3, channel, request_id, log,
+        preserve_gender=preserve_gender,
     )
-    count = _download_merged_export(merged_s3, current_file, channel, work_dir, log)
+    count = _download_merged_export(
+        merged_s3, current_file, channel, work_dir, log,
+        preserve_gender=preserve_gender,
+    )
     _trace(log, "merge execution completed", request_id=request_id, channel=channel,
            merged_s3=merged_s3, unique_row_count=count,
            local_current_file=current_file)
@@ -424,7 +459,8 @@ def _merge_to_current_file(previous_s3, current_s3_prefix, current_file,
 
 
 def merge_current_file(request_id, previous_request_id, channel, current_file,
-                       current_s3_prefix, work_dir, log, orange=False):
+                       current_s3_prefix, work_dir, log, orange=False,
+                       preserve_gender=False):
     """Merge one normal channel through Snowflake, or retain current output.
 
     Orange retains ``account_name`` in the merged file. The caller therefore
@@ -440,7 +476,8 @@ def merge_current_file(request_id, previous_request_id, channel, current_file,
     current_file = Path(current_file)
     _trace(log, "normal-channel merge requested", request_id=request_id,
            previous_request_id=previous_request_id, channel=channel,
-           current_file=current_file, current_s3=_s3_prefix(current_s3_prefix))
+           current_file=current_file, current_s3=_s3_prefix(current_s3_prefix),
+           preserve_gender=preserve_gender)
     _verify_local_file(log, "current channel output before merge", current_file)
     previous_s3 = _previous_path(previous_request_id, channel, log)
     if not previous_s3:
@@ -458,7 +495,7 @@ def merge_current_file(request_id, previous_request_id, channel, current_file,
 
     count, merged_s3 = _merge_to_current_file(
         previous_s3, current_s3_prefix, current_file, channel,
-        request_id, work_dir, log,
+        request_id, work_dir, log, preserve_gender=preserve_gender,
     )
     from REQUEST_PROCESSOR.request_processor import update_channel_storage
     update_channel_storage(request_id, channel, merged_s3, count, log)

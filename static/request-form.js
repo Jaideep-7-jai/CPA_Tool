@@ -201,10 +201,17 @@ document.addEventListener('DOMContentLoaded', () => {
       updateCriteriaControls();
     });
     row.querySelector('.criteria-comparison').addEventListener('change', () => {
-      if (row.querySelector('.criteria-kind').value === 'age' && row.querySelector('.criteria-comparison').value === 'between') {
-        row.querySelector('.criteria-row-value').innerHTML = '<input class="age-from" type="number" min="0" placeholder="From age"><input class="age-to" type="number" min="0" placeholder="To age">';
-      } else {
-        renderCriterionValue(row);
+      const type = row.querySelector('.criteria-kind').value;
+      const comparison = row.querySelector('.criteria-comparison').value;
+      const valueWrap = row.querySelector('.criteria-row-value');
+
+      // Do not call renderCriterionValue() here. It rebuilds the comparison
+      // select and resets the selected value, which made Lesser/Exclude look
+      // available but impossible to keep selected.
+      if (type === 'age') {
+        valueWrap.innerHTML = comparison === 'between'
+          ? '<input class="age-from" type="number" min="0" placeholder="From age"><input class="age-to" type="number" min="0" placeholder="To age">'
+          : '<input class="criteria-value" type="number" min="0" placeholder="Age">';
       }
       syncCriteriaJson();
     });

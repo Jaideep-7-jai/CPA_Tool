@@ -803,6 +803,59 @@ def build_command(payload, db_id, uploaded_zip=None):
     return cmd
 
 
+def _fetch_notification_request(request_uuid):
+    """Read the same request metadata used by processor notifications."""
+    conn = get_db()
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(
+                """
+                SELECT r.id, r.request_name, r.client_name, r.request_type,
+                       r.criteria_type, r.criteria_value, r.comp_type,
+                       r.criteria_json, r.channel, r.output_dir,
+                       r.responder_match, r.responder_days,
+                       r.merge_source_request_id, u.username,
+                       source.request_name AS merge_source_request_name
+                  FROM requests r
+                  JOIN users u ON u.id=r.created_by
+             LEFT JOIN requests source ON source.id=r.merge_source_request_id
+                 WHERE r.request_uuid=%s
+                """,
+                (request_uuid,),
+            )
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def _send_failure_notification_if_needed(request_uuid, error_message, output_dir):
+    """Guarantee one concise failure mail even when a processor exits early."""
+    import logging as _log
+    try:
+        from utils import error_notification_sent, send_error_email
+
+        latest_log = find_latest_log(output_dir)
+        run_dir = Path(latest_log).parent.parent if latest_log else Path(output_dir)
+        if error_notification_sent(run_dir):
+            _log.getLogger(__name__).info(
+                "Failure email already sent by processor for %s; fallback skipped.",
+                request_uuid,
+            )
+            return
+        request_details = _fetch_notification_request(request_uuid)
+        if not request_details:
+            _log.getLogger(__name__).error(
+                "Unable to send failure email: request %s was not found.", request_uuid
+            )
+            return
+        send_error_email(request_details, error_message, run_dir)
+    except Exception as exc:
+        # Notification failure must never hide the original request failure.
+        _log.getLogger(__name__).exception(
+            "Failure-notification fallback failed for %s: %s", request_uuid, exc
+        )
+
+
 
 def run_job(request_uuid, request_name, cmd, output_dir):
     import logging as _log
@@ -842,6 +895,12 @@ def run_job(request_uuid, request_name, cmd, output_dir):
 
         if final_status == "completed":
             _persist_filedetails_to_db(request_uuid, request_name, output_dir)
+        else:
+            _send_failure_notification_if_needed(
+                request_uuid, stderr_text or stdout_text or
+                "Request process exited with code {0}.".format(proc.returncode),
+                output_dir,
+            )
 
     except subprocess.TimeoutExpired:
         _log.getLogger(__name__).error(
@@ -855,6 +914,9 @@ def run_job(request_uuid, request_name, cmd, output_dir):
             stderr_text=f"Job timed out after {JOB_TIMEOUT} seconds.",
             log_file=find_latest_log(output_dir),
         )
+        _send_failure_notification_if_needed(
+            request_uuid, "Job timed out after {0} seconds.".format(JOB_TIMEOUT), output_dir
+        )
     except Exception as exc:
         update_request_db(
             request_uuid,
@@ -864,6 +926,7 @@ def run_job(request_uuid, request_name, cmd, output_dir):
             stderr_text=str(exc),
             log_file=find_latest_log(output_dir),
         )
+        _send_failure_notification_if_needed(request_uuid, str(exc), output_dir)
 
 
 
@@ -925,8 +988,11 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
         finally:
             conn.close()
 
-        # ── 3. Build per-channel update dict from filedetails.json ───
-        channel_updates = {}
+        # ── 3. Aggregate per-channel output metadata ───────────────────
+        # A Gender request can create Male and Female delivery files for one
+        # channel.  Aggregate them before updating the one-row-per-channel
+        # columns so the UI count remains the complete final count.
+        channel_details = {}
         for fd in file_details:
             ch = (fd.get("channel") or "").upper().strip()
 
@@ -945,8 +1011,8 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
             if existing_statuses.get(ch) == "NOT_SELECTED":
                 continue
 
-            row_count  = fd.get("file_count") or fd.get("row_count") or ""
-            filepath = fd.get("s3_path", "")
+            row_count = fd.get("file_count") or fd.get("row_count") or 0
+            filepath = fd.get("final_s3_path") or fd.get("s3_path", "")
             if not filepath and request_meta:
                 request_type, db_request_name, created_date = request_meta
                 path_date = created_date.strftime("%Y%m%d")
@@ -956,10 +1022,30 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
                     base = f"{S3_BASE}/Doordash/{path_date}/{db_request_name}"
                 filepath = f"{base}/{ch}_{export}/"
 
-            channel_updates[f"{ch}_STATUS"]    = "completed"
-            channel_updates[f"{ch}_FILECOUNT"] = str(row_count) if row_count else ""
-            channel_updates[f"{ch}_FILEPATH"]  = filepath
-            channel_updates[f"{ch}_FILESIZE"]  = int(row_count) if row_count else None
+            detail = channel_details.setdefault(ch, {
+                "count": 0, "size": 0, "filepath": filepath,
+                "filenames": [],
+            })
+            try:
+                detail["count"] += int(row_count)
+            except (TypeError, ValueError):
+                pass
+            try:
+                detail["size"] += int(fd.get("file_size_bytes") or 0)
+            except (TypeError, ValueError):
+                pass
+            if filepath:
+                detail["filepath"] = filepath
+            if fd.get("filename"):
+                detail["filenames"].append(str(fd["filename"]))
+
+        channel_updates = {}
+        for ch, detail in channel_details.items():
+            channel_updates[f"{ch}_STATUS"] = "completed"
+            channel_updates[f"{ch}_FILECOUNT"] = str(detail["count"])
+            channel_updates[f"{ch}_FILEPATH"] = detail["filepath"]
+            channel_updates[f"{ch}_FILESIZE"] = detail["size"] or None
+            channel_updates[f"{ch}_FILENAME"] = " | ".join(detail["filenames"])
 
         if channel_updates:
             update_request_db(request_uuid, **channel_updates)
