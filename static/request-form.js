@@ -57,11 +57,33 @@ document.addEventListener('DOMContentLoaded', () => {
   const responderDaysFields = document.getElementById('responderDaysFields');
   const responderDaysEl = document.getElementById('responder_days');
   const responderDaysValueEl = document.getElementById('responder_days_value');
+  const zipRadiusGroup = document.getElementById('zipRadiusGroup');
+  const zipRadiusEnabledEl = document.getElementById('zip_radius_enabled');
+  const zipRadiusFields = document.getElementById('zipRadiusFields');
+  const zipRadiusEl = document.getElementById('zip_radius');
+  const zipRadiusValueEl = document.getElementById('zip_radius_value');
   const criteriaRows = [];
 
   function syncResponderDaysValue() {
     if (!responderDaysEl || !responderDaysValueEl) return;
     responderDaysValueEl.textContent = `${responderDaysEl.value} day${responderDaysEl.value === '1' ? '' : 's'}`;
+  }
+
+  function syncZipRadiusValue() {
+    zipRadiusValueEl.textContent = `${zipRadiusEl.value} mile${zipRadiusEl.value === '1' ? '' : 's'}`;
+  }
+
+  function syncZipRadiusVisibility() {
+    const hasZip = requestTypeEl.value === 'Doordash' ||
+      (['Suppression', 'Mailing'].includes(requestTypeEl.value) &&
+       criteriaRows.some(row => row.querySelector('.criteria-kind').value === 'zips'));
+    zipRadiusGroup.classList.toggle('hidden', !hasZip);
+    zipRadiusEnabledEl.disabled = !hasZip;
+    if (!hasZip) zipRadiusEnabledEl.checked = false;
+    const enabled = hasZip && zipRadiusEnabledEl.checked;
+    zipRadiusFields.classList.toggle('hidden', !enabled);
+    zipRadiusEl.disabled = !enabled;
+    syncZipRadiusValue();
   }
 
   // ── Merge source eligibility check ───────────────────────────────────────
@@ -128,13 +150,13 @@ document.addEventListener('DOMContentLoaded', () => {
     mergeSourceCheckTimer = setTimeout(checkMergeSource, 400);
   }
 
-  const supportedCriteria = ['age', 'state', 'zips', 'gender'];
+  const supportedCriteria = ['age', 'state', 'zips'];
 
   function criterionOptions(selected) {
     return supportedCriteria.map(type => {
       const label = type === 'age' ? 'Age'
         : type === 'state' ? 'State'
-          : type === 'zips' ? 'ZIP' : 'Gender';
+          : 'ZIP';
       return `<option value="${type}" ${type === selected ? 'selected' : ''}>${label}</option>`;
     }).join('');
   }
@@ -149,7 +171,7 @@ document.addEventListener('DOMContentLoaded', () => {
         item.to = row.querySelector('.age-to').value.trim();
       } else if (type === 'age') {
         item.value = row.querySelector('.criteria-value').value.trim();
-      } else if (type === 'state' || type === 'gender') {
+      } else if (type === 'state') {
         item.values = row.querySelector('.criteria-value').value
           .split(',').map(value => value.trim()).filter(Boolean);
       }
@@ -168,10 +190,9 @@ document.addEventListener('DOMContentLoaded', () => {
         <option value="less">Lesser Than</option>
         <option value="between">Between</option>`;
       valueWrap.innerHTML = '<input class="criteria-value" type="number" min="0" placeholder="Age">';
-    } else if (type === 'state' || type === 'gender') {
+    } else if (type === 'state') {
       comparison.innerHTML = '<option value="include">Include</option><option value="exclude">Exclude</option>';
-      const placeholder = type === 'gender' ? 'M, F' : 'CA, TX, NY';
-      valueWrap.innerHTML = `<input class="criteria-value" type="text" placeholder="${placeholder}">`;
+      valueWrap.innerHTML = '<input class="criteria-value" type="text" placeholder="CA, TX, NY">';
     } else {
       comparison.innerHTML = '<option value="include">Include</option><option value="exclude">Exclude</option>';
       valueWrap.innerHTML = '<input type="file" name="zip_file" class="criteria-zip-file" accept=".csv,.txt"><span class="criteria-file-name">Upload ZIP file</span>';
@@ -244,6 +265,7 @@ document.addEventListener('DOMContentLoaded', () => {
         option.disabled = option.value !== select.value && selectedTypes.includes(option.value);
       });
     });
+    syncZipRadiusVisibility();
   }
 
   function resetCriteriaBuilder() {
@@ -273,6 +295,9 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     responderDaysEl.addEventListener('input', syncResponderDaysValue);
     syncResponderDaysValue();
+    zipRadiusEnabledEl.addEventListener('change', syncZipRadiusVisibility);
+    zipRadiusEl.addEventListener('input', syncZipRadiusValue);
+    syncZipRadiusVisibility();
   }
 
   // ── Channel single-click toggle ──────────────────────────────────────────────
@@ -376,6 +401,7 @@ document.addEventListener('DOMContentLoaded', () => {
     scheduleClientNameCheck();
     updateChannelChoices();
     updateCriteriaFields();
+    syncZipRadiusVisibility();
     if (mergeEnabledEl.checked) scheduleMergeSourceCheck();
   }
 
@@ -616,6 +642,9 @@ document.addEventListener('DOMContentLoaded', () => {
         responderDaysFields.classList.add('hidden');
         responderDaysEl.value = '30';
         syncResponderDaysValue();
+        zipRadiusEnabledEl.checked = false;
+        zipRadiusEl.value = '30';
+        syncZipRadiusVisibility();
         // Reset channel visual state
         document.querySelectorAll('.channel-option').forEach(lbl => lbl.classList.remove('checked'));
         [chAll, ...individualChannels].forEach(cb => { cb.checked = false; cb.disabled = false; });

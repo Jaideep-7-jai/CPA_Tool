@@ -71,6 +71,10 @@
                   <span class="request-run-metadata-value">{% if r.responder_match %}Yes &mdash; {{ r.responder_days }} day{% if r.responder_days != 1 %}s{% endif %}{% else %}No{% endif %}</span>
                 </div>
                 <div class="request-run-metadata-item">
+                  <span class="request-run-metadata-label">ZIP Radius:</span>
+                  <span class="request-run-metadata-value">{% if r.zip_radius %}{{ r.zip_radius }} mile{% if r.zip_radius != 1 %}s{% endif %}{% else %}No{% endif %}</span>
+                </div>
+                <div class="request-run-metadata-item">
                   <span class="request-run-metadata-label">Merged Previous Output:</span>
                   <span class="request-run-metadata-value">{% if r.merge_source_request_id %}Yes &mdash; {{ r.merge_source_request_name or 'Previous request' }} (ID: {{ r.merge_source_request_id }}){% else %}No{% endif %}</span>
                 </div>

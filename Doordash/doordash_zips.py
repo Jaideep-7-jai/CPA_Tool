@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import SNOWSQL_PASSPHRASE, AWS_KEY_ID, AWS_SECRET_KEY, S3_BASE
 from utils import run_command, send_success_email, send_error_email
 from MERGE_OUTPUT.merge_output import merge_doordash_file
+from REQUEST_PROCESSOR.zip_radius import expand_zip_radius
 from REQUEST_PROCESSOR.request_processor import (
     _build_common_context,
     _create_zip_staging_table,
@@ -409,10 +410,24 @@ def process_doordash_zip_request(request_id: int, zip_file: str, channel, output
     zip_staging_table = f"APT_CPA_DOORDASH_ZIPS_STAGING_{ts}"
     _step(log, 2, 7, "Creating and loading shared DoorDash ZIP staging table", "DOORDASH")
     _create_zip_staging_table(zip_staging_table, log)
-    zip_count = _load_zips_from_s3(zip_staging_table, s3_zip_path, log)
+    try:
+        radius = request_data.get("zip_radius")
+        if radius is not None:
+            expansion = expand_zip_radius(
+                s3_zip_path, zip_staging_table, int(radius), request_id, log
+            )
+            zip_count = expansion["expanded_count"]
+            _trace(log, "ZIP radius expansion validated",
+                   source_count=expansion["source_count"], expanded_count=zip_count,
+                   radius_miles=radius, expanded_s3_path=expansion["s3_path"])
+        else:
+            zip_count = _load_zips_from_s3(zip_staging_table, s3_zip_path, log)
+    except Exception:
+        _drop_zip_staging_table(zip_staging_table, log)
+        raise
     _trace(log, "ZIP staging validation", staging_table=zip_staging_table,
            loaded_zip_count=zip_count, s3_path=s3_zip_path)
-    if zip_count == 0:
+    if zip_count <= 0:
         _trace(log, "ZIP staging rejected", staging_table=zip_staging_table,
                reason="zero ZIP values loaded")
         _drop_zip_staging_table(zip_staging_table, log)

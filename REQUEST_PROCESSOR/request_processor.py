@@ -3,7 +3,7 @@
 Consolidated criteria processor for Suppression and Mailing requests.
 
 This module owns the complete non-DoorDash processing path for Age, State,
-ZIP, Gender, and any supported combination of those criteria. It replaces
+ZIP, and any supported combination of those criteria. It replaces
 the old AGE_STATE, ZIPS, and MULTI_CRITERIA runtime routes. DoorDash imports
 the shared low-level helpers it needs from here, but retains its own workflow.
 
@@ -56,6 +56,7 @@ Processing flow
 """
 
 import csv
+import io
 import json
 import os
 import re
@@ -67,9 +68,8 @@ import pymysql
 import subprocess
 import shlex
 import pandas as pd
-from itertools import chain
 from pathlib import Path
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import SNOWSQL_PASSPHRASE, AWS_KEY_ID, AWS_SECRET_KEY, S3_BASE
@@ -79,7 +79,8 @@ from utils import (
     send_error_email,
     ensure_output_dir,
 )
-from MERGE_OUTPUT.merge_output import merge_current_file
+from MERGE_OUTPUT.merge_output import merge_current_file, update_orange_merge_source_storage
+from REQUEST_PROCESSOR.zip_radius import expand_zip_radius
 
 DB_CONFIG = {
     # Service-provided values; do not put operational credentials in Git.
@@ -256,7 +257,7 @@ def fetch_request_details(request_id):
                 SELECT r.id, r.client_name, r.request_type, r.request_name,
                        r.criteria_type, r.criteria_value, r.comp_type,
                        r.criteria_json, r.channel, r.output_dir,
-                       r.responder_match, r.responder_days,
+                       r.responder_match, r.responder_days, r.zip_radius,
                        r.merge_source_request_id,
                        u.username,
                        source.request_name AS merge_source_request_name
@@ -477,6 +478,37 @@ def _query_snowflake(query_sql, log):
         return -1
 
 
+def _query_copy_unload_rows(copy_sql, log):
+    """Run a Snowflake S3 unload and sum the ROW_COUNT column, or fail."""
+    os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
+    output = run_command([
+        "snowsql", "-c", "datateam1", "-q", copy_sql,
+        "-o", "output_format=csv", "-o", "header=true",
+        "-o", "timing=false", "-o", "friendly=false",
+        "-o", "exit_on_error=true",
+    ])
+    rows = list(csv.reader(io.StringIO(output)))
+    for position, row in enumerate(rows):
+        headings = [field.strip().upper() for field in row]
+        if "ROW_COUNT" not in headings:
+            continue
+        count_position = headings.index("ROW_COUNT")
+        counts = []
+        for result in rows[position + 1:]:
+            if len(result) != len(headings):
+                continue
+            value = result[count_position].strip()
+            if not value.isdigit():
+                raise RuntimeError("Snowflake unload returned a nonnumeric ROW_COUNT.")
+            counts.append(int(value))
+        if not counts:
+            raise RuntimeError("Snowflake unload returned no file row counts.")
+        total = sum(counts)
+        _trace(log, "Snowflake S3 unload verified", files=len(counts), rows=total)
+        return total
+    raise RuntimeError("Snowflake unload did not return a ROW_COUNT column.")
+
+
 def _count_file_lines(file_path):
     cmd    = f"wc -l < {shlex.quote(str(file_path))}"
     result = subprocess.check_output(cmd, shell=True, universal_newlines=True).strip()
@@ -672,30 +704,49 @@ def _insert_into_perm_table(
 
 
 def _export_complete_final_file(export_type, perm_table, export_path, channel_name,
-                                log, include_gender=False):
+                                log, criteria_columns=None, request_type=None,
+                                orange_merge_source=False):
     """
     Export FINAL / COMPLETE file from permanent table -> S3 path.
     FINAL   : DISTINCT email (GREEN/BLUE/ARCAMAX)  |  DISTINCT email_address, account_name (ORANGE)
     COMPLETE: email, ZIP     (GREEN/BLUE/ARCAMAX)  |  email_address, ZIP, account_name      (ORANGE)
 
-    ``include_gender`` is used only by the consolidated Gender workflow.  It
-    retains the selected record's gender long enough to create separate Male
-    and Female delivery files, while leaving standard Age/State/ZIP exports
-    unchanged.
+    ``criteria_columns`` selects the consolidated request's audit fields in
+    their original selection order.  If omitted, preserve the DoorDash ZIP
+    helper's existing output format.
     """
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
 
     channel_name = str(channel_name).upper()
-    if export_type == "FINAL":
+    if criteria_columns is not None:
         if channel_name == "ORANGE":
-            select_clause = "DISTINCT email_address, account_name" + (", gender" if include_gender else "")
+            email = 'email_address AS "email"'
+            account = 'account_name AS "accountname"'
+            if export_type == "COMPLETE":
+                selected = [email, account] + [
+                    '{0} AS "{1}"'.format(col.upper(), col) for col in criteria_columns
+                ]
+                select_clause = ", ".join(selected)
+            elif orange_merge_source or str(request_type).lower() == "mailing":
+                select_clause = "DISTINCT " + email + ", " + account
+            else:
+                select_clause = "DISTINCT " + email
+        elif export_type == "COMPLETE":
+            select_clause = ", ".join(['email AS "email"'] + [
+                '{0} AS "{1}"'.format(col.upper(), col) for col in criteria_columns
+            ])
         else:
-            select_clause = "DISTINCT email" + (", gender" if include_gender else "")
+            select_clause = 'DISTINCT email AS "email"'
+    elif export_type == "FINAL":
+        if channel_name == "ORANGE":
+            select_clause = "DISTINCT email_address, account_name"
+        else:
+            select_clause = "DISTINCT email"
     else:  # COMPLETE
         if channel_name == "ORANGE":
-            select_clause = "email_address, ZIP, account_name" + (", gender" if include_gender else "")
+            select_clause = "email_address, ZIP, account_name"
         else:
-            select_clause = "email, ZIP" + (", gender" if include_gender else "")
+            select_clause = "email, ZIP"
 
     sql = (
         f"COPY INTO '{export_path}/' "
@@ -705,7 +756,7 @@ def _export_complete_final_file(export_type, perm_table, export_path, channel_na
         f"FIELD_OPTIONALLY_ENCLOSED_BY='\"' "
         f"NULL_IF=() EMPTY_FIELD_AS_NULL=FALSE) "
         f"HEADER=TRUE "
-        f"MAX_FILE_SIZE=490000000;"
+        f"MAX_FILE_SIZE=490000000 DETAILED_OUTPUT=TRUE;"
     )
 
     _trace(log, "S3 export parameters", export_type=export_type,
@@ -716,7 +767,7 @@ def _export_complete_final_file(export_type, perm_table, export_path, channel_na
     log.info(f"  SELECT clause: {select_clause}")
     log.info(f"  Executing COPY INTO ({export_type} FILE) via snowsql ...")
 
-    unloaded_rows = _query_snowflake(sql, log)
+    unloaded_rows = _query_copy_unload_rows(sql, log)
     log.info(f"  COPY INTO ({export_type} FILE) completed successfully")
 
     if unloaded_rows >= 0:
@@ -738,7 +789,7 @@ def _drop_perm_table(perm_table, log):
 # ── Download + combine helper ─────────────────────────────────────────────────
 
 def _download_and_combine(s3_path, download_dir, work_dir,
-                           output_file, channel_name, log, include_gender=False):
+                           output_file, channel_name, log, final_header=None):
     """
     Download Snowflake part files and stream them into one pipe-delimited
     output.  Snowflake writes a header in *every* part.  The old shell pipeline
@@ -750,12 +801,12 @@ def _download_and_combine(s3_path, download_dir, work_dir,
     download_dir = Path(download_dir)
     work_dir = Path(work_dir)
     channel_name = str(channel_name).upper()
-    if channel_name == "ORANGE":
+    if final_header is not None:
+        output_header = list(final_header)
+    elif channel_name == "ORANGE":
         output_header = ["email_address", "account_name"]
     else:
         output_header = ["email"]
-    if include_gender:
-        output_header.append("gender")
 
     shutil.rmtree(str(download_dir), ignore_errors=True)
     download_dir.mkdir(parents=True, exist_ok=True)
@@ -804,16 +855,24 @@ def _download_and_combine(s3_path, download_dir, work_dir,
                     reader = csv.reader(source, delimiter="|")
                     first_row = next(reader, None)
                     expected = [column.lower() for column in output_header]
-                    if first_row:
-                        actual = [str(value).strip().lower() for value in first_row]
-                        # The expected Snowflake header must be skipped for
-                        # every part.  If a non-standard unheadered file is
-                        # received, preserve its first data row instead.
-                        if actual[:len(expected)] != expected:
-                            reader = chain((first_row,), reader)
+                    if not first_row:
+                        raise RuntimeError("Snowflake FINAL part has no header: {0}".format(part))
+                    actual = [str(value).strip().lower() for value in first_row]
+                    if actual != expected:
+                        raise RuntimeError(
+                            "Unexpected FINAL header in {0}: {1}; expected {2}".format(
+                                part, actual, expected
+                            )
+                        )
                     for row in reader:
                         if not row:
                             continue
+                        if len(row) != len(output_header):
+                            raise RuntimeError(
+                                "FINAL row in {0} has {1} columns; expected {2}".format(
+                                    part, len(row), len(output_header)
+                                )
+                            )
                         values = [str(row[index]).strip() if len(row) > index else ""
                                   for index in range(len(output_header))]
                         if not values[0]:
@@ -1670,25 +1729,9 @@ def _post_to_ftp(final_files_dir, path_date, output_file, log, request_type=None
 # The original ZIP-only functions above remain private compatibility helpers for
 # the DoorDash workflow.  All Suppression and Mailing requests now enter through
 # process_request() below, regardless of whether they contain one criterion or
-# a mixture of Age, State, ZIP, and Gender criteria.
+# a mixture of Age, State, and ZIP criteria.
 
-CONSOLIDATED_CRITERIA = ("age", "state", "zips", "gender")
-
-# These defaults follow the existing AGE/STATE/ZIP source aliases.  They are
-# deliberately configurable because a source schema can use a different gender
-# column name without requiring a code release.
-GENDER_COLUMNS = {
-    "GREEN": os.environ.get("CPA_GENDER_GREEN_COLUMN", "b.GENDER"),
-    "BLUE": os.environ.get("CPA_GENDER_BLUE_COLUMN", "b.GENDER"),
-    "ARCAMAX": os.environ.get("CPA_GENDER_ARCAMAX_COLUMN", "GENDER"),
-    "ORANGE": os.environ.get("CPA_GENDER_ORANGE_COLUMN", "a.GENDER"),
-}
-
-
-def get_dob_cutoff(min_age, comp_type=None):
-    """Return the date boundary used by DOB-based channel sources."""
-    del comp_type
-    return (date.today() - timedelta(days=365.25 * int(min_age))).strftime("%Y-%m-%d")
+CONSOLIDATED_CRITERIA = ("age", "state", "zips")
 
 
 def _safe_identifier(value):
@@ -1703,7 +1746,7 @@ def _safe_sql_identifier(value, label):
 
 
 def _criterion_values(item):
-    """Return a cleaned list for state/gender criteria."""
+    """Return cleaned State values."""
     values = item.get("values")
     if values is None:
         values = item.get("value", "")
@@ -1725,7 +1768,7 @@ def _fetch_consolidated_request(request_id):
                        r.criteria_type, r.comp_type, r.criteria_value,
                        r.criteria_json, r.zip_file_path, r.channel,
                        r.output_dir, r.merge_source_request_id,
-                       r.responder_match, r.responder_days, u.username,
+                       r.responder_match, r.responder_days, r.zip_radius, u.username,
                        source.request_name AS merge_source_request_name
                   FROM requests r
                   JOIN users u ON u.id = r.created_by
@@ -1761,7 +1804,7 @@ def _criteria_from_request(request_data):
             else:
                 criteria = [{"type": "age", "comparison": comparison,
                              "value": str(value)}]
-        elif criteria_type in ("state", "gender"):
+        elif criteria_type == "state":
             criteria = [{"type": criteria_type, "comparison": comparison,
                          "values": [part.strip() for part in str(value).split(",")
                                     if part.strip()]}]
@@ -1774,7 +1817,7 @@ def _criteria_from_request(request_data):
     if not isinstance(criteria, list) or not criteria:
         raise ValueError("At least one criterion is required.")
     if len(criteria) > len(CONSOLIDATED_CRITERIA):
-        raise ValueError("A request can contain at most Age, State, ZIP, and Gender.")
+        raise ValueError("A request can contain at most Age, State, and ZIP.")
 
     normalised = []
     seen = set()
@@ -1808,7 +1851,7 @@ def _criteria_from_request(request_data):
                     raise ValueError("Age requires a numeric value.")
             else:
                 raise ValueError("Age supports Greater Than, Lesser Than, or Between.")
-        elif item_type in ("state", "gender"):
+        elif item_type == "state":
             item["values"] = _criterion_values(item)
             if comparison not in ("include", "exclude") or not item["values"]:
                 raise ValueError(
@@ -1825,15 +1868,24 @@ def _criteria_from_request(request_data):
 def _column_map(channel):
     channel = str(channel).upper()
     if channel in ("GREEN", "BLUE"):
-        return {"age": "b.AGE", "state": "b.STATE", "zips": "b.ZIP",
-                "gender": _safe_sql_identifier(GENDER_COLUMNS[channel], "gender")}
+        return {"age": "b.AGE", "state": "b.STATE", "zips": "b.ZIP"}
     if channel == "ARCAMAX":
-        return {"age": "birthday", "state": "STATE", "zips": "ZIP",
-                "gender": _safe_sql_identifier(GENDER_COLUMNS[channel], "gender")}
+        return {"age": "birthday", "state": "STATE", "zips": "ZIP"}
     if channel == "ORANGE":
-        return {"age": "a.dob", "state": "a.STATE", "zips": "a.ZIP",
-                "gender": _safe_sql_identifier(GENDER_COLUMNS[channel], "gender")}
+        return {"age": "a.dob", "state": "a.STATE", "zips": "a.ZIP"}
     raise ValueError("Unsupported channel: {0}".format(channel))
+
+
+def _age_expression(channel):
+    """Use the same integer age in filtering and COMPLETE output."""
+    source = _column_map(channel)["age"]
+    if channel in ("GREEN", "BLUE"):
+        return "TRY_TO_NUMBER(TO_VARCHAR({0}))".format(source)
+    birthday = "TRY_TO_DATE(TO_VARCHAR({0}))".format(source)
+    years = "DATEDIFF(year, {0}, CURRENT_DATE())".format(birthday)
+    return "({0} - IFF(DATEADD(year, {0}, {1}) > CURRENT_DATE(), 1, 0))".format(
+        years, birthday
+    )
 
 
 def _criteria_predicate(channel, criteria, zip_staging_table, log):
@@ -1850,52 +1902,20 @@ def _criteria_predicate(channel, criteria, zip_staging_table, log):
                        "{0},{1}".format(item.get("from", ""), item.get("to", ""))),
                zip_staging_table=(zip_staging_table or "not used"))
         if item_type == "age":
-            column = columns["age"]
+            column = _age_expression(channel)
             if comparison == "between":
                 low, high = sorted((int(item["from"]), int(item["to"])))
-                if channel in ("GREEN", "BLUE"):
-                    conditions.append("{0} BETWEEN {1} AND {2}".format(column, low, high))
-                else:
-                    conditions.append(
-                        "TRY_TO_DATE({0}) BETWEEN '{1}' AND '{2}'".format(
-                            column, get_dob_cutoff(high), get_dob_cutoff(low)
-                        )
-                    )
+                conditions.append("{0} BETWEEN {1} AND {2}".format(column, low, high))
             else:
                 age_value = int(item["value"])
-                if channel in ("GREEN", "BLUE"):
-                    operator = ">=" if comparison == "greater" else "<"
-                    conditions.append("{0} {1} {2}".format(column, operator, age_value))
-                else:
-                    operator = "<=" if comparison == "greater" else ">="
-                    conditions.append(
-                        "TRY_TO_DATE({0}) {1} '{2}'".format(
-                            column, operator, get_dob_cutoff(age_value)
-                        )
-                    )
-        elif item_type in ("state", "gender"):
+                operator = ">" if comparison == "greater" else "<"
+                conditions.append("{0} {1} {2}".format(column, operator, age_value))
+        elif item_type == "state":
             values = [value.replace("'", "''") for value in item["values"]]
             operator = "IN" if comparison == "include" else "NOT IN"
-            if item_type == "gender":
-                # The request form accepts M/F, while source systems can use
-                # either M/F or MALE/FEMALE.  Match both representations and
-                # normalise the final output name separately.
-                expanded_values = []
-                for value in values:
-                    normalised = _gender_label(value)
-                    if normalised == "MALE":
-                        expanded_values.extend(["M", "MALE"])
-                    elif normalised == "FEMALE":
-                        expanded_values.extend(["F", "FEMALE"])
-                    else:
-                        expanded_values.append(value)
-                values = list(dict.fromkeys(expanded_values))
-                column = "UPPER(TRIM({0}))".format(columns[item_type])
-            else:
-                column = columns[item_type]
             conditions.append(
                 "{0} {1} ({2})".format(
-                    column, operator,
+                    columns[item_type], operator,
                     ",".join("'{0}'".format(value) for value in values)
                 )
             )
@@ -1916,51 +1936,22 @@ def _criteria_predicate(channel, criteria, zip_staging_table, log):
     return predicate
 
 
-def _gender_label(value):
-    """Return the delivery filename label for a saved gender value."""
-    cleaned = str(value or "").strip().upper()
-    if cleaned in ("M", "MALE"):
-        return "MALE"
-    if cleaned in ("F", "FEMALE"):
-        return "FEMALE"
-    return cleaned
-
-
-def _gender_delivery_labels(criteria, request_type):
-    """Return requested Gender labels for split Suppression output only."""
-    if str(request_type).lower() != "suppression":
-        return []
-    labels = []
-    for item in criteria:
-        if item.get("type") != "gender" or item.get("comparison") != "include":
-            continue
-        for value in item.get("values") or []:
-            label = _gender_label(value)
-            if label and label not in labels:
-                labels.append(label)
-    return labels
-
-
-def _gender_select_expression(channel):
-    """Create one stable MALE/FEMALE-compatible SQL output column."""
-    column = _column_map(channel)["gender"]
-    return (
-        "CASE UPPER(TRIM(COALESCE({0}, ''))) "
-        "WHEN 'M' THEN 'MALE' WHEN 'MALE' THEN 'MALE' "
-        "WHEN 'F' THEN 'FEMALE' WHEN 'FEMALE' THEN 'FEMALE' "
-        "ELSE UPPER(TRIM(COALESCE({0}, ''))) END AS gender"
-    ).format(column)
-
-
 def _create_criteria_channel_table(perm_table, channel, criteria,
                                    zip_staging_table, responder_match,
-                                   responder_days, log, include_gender=False):
+                                   responder_days, log):
     """Create one channel's standardised table for any supported criteria set."""
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
     channel = str(channel).upper()
     predicate = _criteria_predicate(channel, criteria, zip_staging_table, log)
     responder_join = _responder_join(channel, responder_match, responder_days)
-    gender_select = ", " + _gender_select_expression(channel) if include_gender else ""
+    selected = {item["type"] for item in criteria}
+    columns = _column_map(channel)
+    output_columns = []
+    for kind, alias in (("age", "AGE"), ("state", "STATE"), ("zips", "ZIP")):
+        if kind in selected:
+            value = _age_expression(channel) if kind == "age" else columns[kind]
+            output_columns.append("{0} AS {1}".format(value, alias))
+    selected_columns = ", " + ", ".join(output_columns)
     if channel in ("GREEN", "BLUE"):
         profile_table = (
             "GREEN_LPT.UNIVERSAL_PROFILE" if channel == "GREEN"
@@ -1968,22 +1959,23 @@ def _create_criteria_channel_table(perm_table, channel, criteria,
         )
         sql = (
             "CREATE OR REPLACE TABLE {perm} AS "
-            "SELECT a.email, b.ZIP{gender_select} FROM {profile} a "
+            "SELECT a.email{selected_columns} FROM {profile} a "
             "JOIN APT_CUSTOM_GREEN_REA_DATA_DND b ON a.md5hash=b.EMAIL_MD5 "
             "{responder_join}WHERE {predicate};"
         ).format(perm=perm_table, profile=profile_table,
                  responder_join=responder_join, predicate=predicate,
-                 gender_select=gender_select)
+                 selected_columns=selected_columns)
     elif channel == "ARCAMAX":
         sql = (
             "CREATE OR REPLACE TABLE {perm} AS "
-            "SELECT email, ZIP{gender_select} FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
+            "SELECT email{selected_columns} FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
             "WHERE {predicate};"
-        ).format(perm=perm_table, predicate=predicate, gender_select=gender_select)
+        ).format(perm=perm_table, predicate=predicate,
+                 selected_columns=selected_columns)
     else:
         sql = (
             "CREATE OR REPLACE TABLE {perm} AS "
-            "SELECT a.email_address, a.ZIP, esp.ACCOUNT_NAME{gender_select} "
+            "SELECT a.email_address, esp.ACCOUNT_NAME AS account_name{selected_columns} "
             "FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a "
             "JOIN APT_ADHOC_JAIDEEP_ZIP_ESP_DETAILS_INCLUDE_ORANGE_20260604 esp "
             "ON a.FEED_ID=esp.FEEDID "
@@ -1993,14 +1985,16 @@ def _create_criteria_channel_table(perm_table, channel, criteria,
             "QUALIFY ROW_NUMBER() OVER (PARTITION BY a.email_address "
             "ORDER BY a.created_at DESC)=1;"
         ).format(perm=perm_table, responder_join=responder_join,
-                 predicate=predicate, gender_select=gender_select)
+                 predicate=predicate, selected_columns=selected_columns)
     _trace(log, "Snowflake criteria table creation", channel=channel,
            target_table=perm_table, responder_match=bool(responder_match),
            responder_days=(responder_days if responder_match else "not enabled"),
-           gender_output_enabled=include_gender,
+           selected_columns=",".join(item["type"] for item in criteria),
            sql=_safe_sql_for_log(sql))
     run_command(["snowsql", "-c", "datateam1", "-q", sql])
     count = _query_snowflake("SELECT COUNT(*) FROM {0}".format(perm_table), log)
+    if count < 0:
+        raise RuntimeError("Could not verify Snowflake row count for {0}".format(perm_table))
     _trace(log, "Snowflake criteria table validated", channel=channel,
            target_table=perm_table, row_count=count)
     return count
@@ -2054,11 +2048,11 @@ def _write_orange_delivery(raw_file, context, request_type, log):
         reader = csv.DictReader(source, delimiter="|")
         fieldnames = reader.fieldnames or []
         email_column = "email_address" if "email_address" in fieldnames else "email"
-        account_column = "account_name"
-        if email_column not in fieldnames or account_column not in fieldnames:
-            raise RuntimeError(
-                "Orange raw output must contain email/email_address and account_name columns."
-            )
+        account_column = "accountname" if "accountname" in fieldnames else "account_name"
+        if email_column not in fieldnames:
+            raise RuntimeError("Orange raw output must contain an email column.")
+        if str(request_type).lower() == "mailing" and account_column not in fieldnames:
+            raise RuntimeError("Orange Mailing output must contain an accountname column.")
         _trace(log, "Orange raw delivery header validated", raw_file=raw_file,
                email_column=email_column, account_column=account_column,
                request_type=request_type)
@@ -2136,77 +2130,6 @@ def _write_orange_delivery(raw_file, context, request_type, log):
     return archive_name, archive_file, record_count
 
 
-def _write_gender_suppression_delivery(raw_file, context, channel, gender_labels, log):
-    """Split a Gender Suppression extract into one email-only file per gender.
-
-    The raw FINAL S3 export includes gender only for this workflow.  It is
-    streamed once and no raw email/account/ZIP audit column is copied into a
-    delivery file.  The requested filenames match the established format:
-    ``Gender_Suppression_MALE_GREEN_YYYYMMDD.csv``.
-    """
-    raw_file = Path(raw_file)
-    final_dir = context["final_files_dir"]
-    channel = str(channel).upper()
-    _verify_local_file(log, "Gender raw output", raw_file)
-    writers = {}
-    counts = {}
-    artifacts = []
-    try:
-        with open(str(raw_file), "r", newline="") as source:
-            reader = csv.DictReader(source, delimiter="|")
-            fieldnames = reader.fieldnames or []
-            email_column = "email_address" if "email_address" in fieldnames else "email"
-            if email_column not in fieldnames or "gender" not in fieldnames:
-                raise RuntimeError(
-                    "Gender delivery requires FINAL data with email and gender columns."
-                )
-            _trace(log, "Gender delivery header validated", channel=channel,
-                   raw_file=raw_file, email_column=email_column,
-                   gender_labels=",".join(gender_labels))
-            for label in gender_labels:
-                filename = "Gender_Suppression_{0}_{1}_{2}.csv".format(
-                    label, channel, context["path_date"]
-                )
-                output = final_dir / filename
-                handle = open(str(output), "w", newline="")
-                writer = csv.writer(handle, lineterminator="\n")
-                writer.writerow(["email"])
-                writers[label] = (output, handle, writer)
-                counts[label] = 0
-
-            for row in reader:
-                label = _gender_label(row.get("gender"))
-                if label not in writers:
-                    continue
-                email = str(row.get(email_column) or "").strip()
-                if not email:
-                    continue
-                writers[label][2].writerow([email])
-                counts[label] += 1
-    finally:
-        for output, handle, writer in writers.values():
-            del output, writer
-            handle.close()
-
-    for label in gender_labels:
-        output = writers[label][0]
-        count = counts[label]
-        _verify_local_file(log, "Gender {0} delivery".format(label), output)
-        _trace(log, "Gender suppression delivery created", channel=channel,
-               gender=label, filename=output.name, row_count=count)
-        artifacts.append({
-            "channel": channel,
-            "file": output.name,
-            "final_file_path": str(output),
-            "count": count,
-            "delivery_header": "email",
-            "gender": label,
-        })
-    if not artifacts:
-        raise RuntimeError("No Gender delivery artifacts were created.")
-    return artifacts
-
-
 def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir, channel):
     """Run one complete non-DoorDash channel using the common criteria engine."""
     channel = str(channel).upper()
@@ -2215,20 +2138,26 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
     log = setup_processor_channel_logging(run_dir, channel)
     started = time.time()
     table_created = False
-    gender_labels = _gender_delivery_labels(criteria, request_data["request_type"])
-    include_gender = bool(gender_labels)
-    final_data_header = (
-        "email_address|account_name" if channel == "ORANGE" else "email"
-    ) + ("|gender" if include_gender else "")
-    complete_data_header = (
-        "email_address|ZIP|account_name" if channel == "ORANGE" else "email|ZIP"
-    ) + ("|gender" if include_gender else "")
+    selected_columns = ["zip" if item["type"] == "zips" else item["type"]
+                        for item in criteria]
+    is_orange_mailing = (channel == "ORANGE" and
+                         str(request_data["request_type"]).lower() == "mailing")
+    final_data_header = "email|accountname" if is_orange_mailing else "email"
+    complete_data_header = "|".join(
+        (["email", "accountname"] if channel == "ORANGE" else ["email"])
+        + selected_columns
+    )
+    orange_merge_source_s3 = (
+        "{0}/{1}/{2}/{3}/ORANGE_MERGE_SOURCE".format(
+            S3_BASE, request_data["request_type"], context["path_date"],
+            _safe_identifier(request_data["request_name"])
+        ) if channel == "ORANGE" and not is_orange_mailing else None
+    )
     _trace(log, "consolidated channel start", request_id=request_id, channel=channel,
            criteria_json=json.dumps(criteria, sort_keys=True),
            zip_staging_table=(zip_staging_table or "not used"),
            merge_source_request_id=(request_data.get("merge_source_request_id") or "NULL"),
            final_s3=context["path_FINAL"], complete_s3=context["path_COMPLETE"],
-           gender_split_labels=",".join(gender_labels) or "not enabled",
            final_data_header=final_data_header,
            complete_data_header=complete_data_header)
     try:
@@ -2238,7 +2167,6 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
         count = _create_criteria_channel_table(
             context["perm_table"], channel, criteria, zip_staging_table,
             request_data.get("responder_match"), request_data.get("responder_days"), log,
-            include_gender=include_gender,
         )
         table_created = True
         if count == 0:
@@ -2252,14 +2180,25 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
         update_request_status(request_id, "Exporting Final File", channel + "_STATUS", log)
         final_export_count = _export_complete_final_file(
             "FINAL", context["perm_table"], context["path_FINAL"], channel, log,
-            include_gender=include_gender,
+            criteria_columns=selected_columns, request_type=request_data["request_type"],
         )
         _step(log, 3, 9, "Exporting complete audit data to S3", channel)
         update_request_status(request_id, "Exporting Complete File", channel + "_STATUS", log)
         complete_export_count = _export_complete_final_file(
             "COMPLETE", context["perm_table"], context["path_COMPLETE"], channel, log,
-            include_gender=include_gender,
+            criteria_columns=selected_columns, request_type=request_data["request_type"],
         )
+        if orange_merge_source_s3:
+            _trace(log, "exporting private Orange merge source",
+                   s3_path=orange_merge_source_s3)
+            _export_complete_final_file(
+                "FINAL", context["perm_table"], orange_merge_source_s3,
+                channel, log, criteria_columns=selected_columns,
+                request_type=request_data["request_type"],
+                orange_merge_source=True,
+            )
+        elif channel == "ORANGE":
+            orange_merge_source_s3 = context["path_FINAL"]
 
         _step(log, 4, 9, "Dropping validated Snowflake table", channel)
         _drop_perm_table(context["perm_table"], log)
@@ -2271,7 +2210,7 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
         _download_and_combine(
             context["path_FINAL"], context["channel_tmp"] / "download",
             context["channel_tmp"], context["output_file"], channel, log,
-            include_gender=include_gender,
+            final_header=final_data_header.split("|"),
         )
         _verify_local_file(log, "combined current output", raw_file)
 
@@ -2280,7 +2219,8 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
             merge_result = merge_current_file(
                 request_id, request_data["merge_source_request_id"], channel,
                 raw_file, context["path_FINAL"], context["channel_tmp"], log,
-                preserve_gender=include_gender,
+                orange_merge_source_s3=orange_merge_source_s3,
+                request_type=request_data["request_type"],
             )
             count = merge_result["count"]
             merge_mode = merge_result["merge_mode"]
@@ -2290,22 +2230,15 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
             count = max(_count_file_lines(str(raw_file)) - 1, 0)
             merge_mode = "CURRENT_ONLY"
             output_s3 = context["path_FINAL"]
+            if channel == "ORANGE":
+                update_orange_merge_source_storage(
+                    request_id, orange_merge_source_s3, log
+                )
             _trace(log, "merge skipped", channel=channel,
                    reason="merge_source_request_id is NULL", row_count=count)
 
         _step(log, 7, 9, "Building current request delivery artifact", channel)
-        if include_gender:
-            artifacts = _write_gender_suppression_delivery(
-                raw_file, context, channel, gender_labels, log
-            )
-            delivery_count = sum(item["count"] for item in artifacts)
-            if delivery_count != count:
-                raise RuntimeError(
-                    "Gender delivery count ({0}) does not match FINAL count ({1}); "
-                    "a merge source without retained gender values cannot be split safely."
-                    .format(delivery_count, count)
-                )
-        elif channel == "ORANGE":
+        if channel == "ORANGE":
             output_name, final_file, count = _write_orange_delivery(
                 raw_file, context, request_data["request_type"], log
             )
@@ -2455,12 +2388,25 @@ def process_request(request_id, channel, output_dir=None, zip_file=None):
             run_command(["aws", "s3", "cp", selected_zip_file, s3_zip, "--quiet"])
             zip_staging_table = "APT_CPA_REQUEST_ZIPS_{0}_{1}".format(request_id, datetime.now().strftime("%H%M%S"))
             _create_zip_staging_table(zip_staging_table, log)
-            zip_count = _load_zips_from_s3(zip_staging_table, s3_zip, log)
+            radius = request_data.get("zip_radius")
+            if radius is not None:
+                expansion = expand_zip_radius(
+                    s3_zip, zip_staging_table, int(radius), request_id, log
+                )
+                zip_count = expansion["expanded_count"]
+                _trace(log, "ZIP radius expansion validated",
+                       original_count=expansion["source_count"],
+                       expanded_count=zip_count, radius_miles=radius,
+                       expanded_s3_path=expansion["s3_path"])
+            else:
+                zip_count = _load_zips_from_s3(zip_staging_table, s3_zip, log)
             if zip_count <= 0:
                 raise RuntimeError("ZIP criterion file contains no ZIP values.")
             _trace(log, "ZIP staging validated", staging_table=zip_staging_table,
                    zip_count=zip_count, s3_path=s3_zip)
         else:
+            if request_data.get("zip_radius") is not None:
+                raise ValueError("ZIP radius requires a ZIP criterion.")
             _trace(log, "ZIP staging skipped", reason="no ZIP criterion")
 
         for selected_channel in channels_to_run:

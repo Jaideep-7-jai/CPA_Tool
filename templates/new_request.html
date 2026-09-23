@@ -7,7 +7,7 @@
 <style>
 .responder-range-header { display:flex; justify-content:space-between; align-items:center; margin:10px 0 6px; font-size:.84rem; color:var(--muted); }
 .responder-range-value { color:var(--primary); font-weight:700; }
-#responder_days { width:100%; accent-color:var(--primary); }
+#responder_days, #zip_radius { width:100%; accent-color:var(--primary); }
 </style>
 <div class="request-page-container">
 
@@ -61,7 +61,6 @@
           <option value="age">🎂 Age</option>
           <option value="state">🗺️ State</option>
           <option value="zips">📮 Zips</option>
-          <option value="gender">👤 Gender</option>
         </select>
       </div>
 
@@ -79,7 +78,7 @@
         <select name="comp_type" id="comp_type" disabled>
           <option value="include">Include</option>
           <option value="exclude">Exclude</option>
-          <option value="greater">Greater Than or Equal To (Age)</option>
+          <option value="greater">Greater Than (Age)</option>
           <option value="less">Less Than (Age)</option>
         </select>
       </div>
@@ -93,7 +92,25 @@
           <i class="bi bi-plus-lg"></i> Add Criteria
         </button>
         <input type="hidden" name="criteria_json" id="criteria_json">
-        <small>Use each criterion once. Matching any selected criterion includes the record.</small>
+        <small>Use Age, State, or ZIP once each. Matching any selected criterion includes the record.</small>
+      </div>
+
+      <!-- ZIP radius applies to an uploaded ZIP criterion or DoorDash ZIP request. -->
+      <div class="form-group hidden" id="zipRadiusGroup">
+        <label class="merge-toggle-label">
+          <input type="checkbox" name="zip_radius_enabled" value="1" id="zip_radius_enabled">
+          <span>ZIP Radius</span>
+        </label>
+        <div id="zipRadiusFields" class="hidden">
+          <div class="responder-range-header">
+            <span>Distance from uploaded ZIP codes</span>
+            <output id="zip_radius_value" class="responder-range-value" for="zip_radius">30 miles</output>
+          </div>
+          <input type="range" name="zip_radius" id="zip_radius"
+                 min="1" max="100" step="1" value="30" disabled
+                 aria-describedby="zip_radius_help">
+          <small id="zip_radius_help">Match ZIP codes within 1–100 miles of those in the uploaded file.</small>
+        </div>
       </div>
 
       <!-- 5. Optional responder match -->
@@ -201,7 +218,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='request-form.js') }}?v=20260922-consolidated-processor" defer></script>
+<script src="{{ url_for('static', filename='request-form.js') }}?v=20260923-zip-radius" defer></script>
 <script>
 // Sync checkbox → visual "checked" class
 document.querySelectorAll('.channel-option').forEach(lbl => {

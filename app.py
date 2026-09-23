@@ -124,10 +124,12 @@ def init_db():
                     merge_source_request_id BIGINT NULL,
                     responder_match TINYINT(1) NOT NULL DEFAULT 0,
                     responder_days  INT NULL,
+                    zip_radius      INT NULL,
                     GREEN_MERGE_STATUS VARCHAR(20) NULL,
                     BLUE_MERGE_STATUS VARCHAR(20) NULL,
                     ARCAMAX_MERGE_STATUS VARCHAR(20) NULL,
                     ORANGE_MERGE_STATUS VARCHAR(20) NULL,
+                    ORANGE_MERGE_SOURCE_FILEPATH VARCHAR(500) NULL,
                     APPTNESS_MERGE_STATUS VARCHAR(20) NULL,
                     DOORDASH_EMAIL_FILEPATH VARCHAR(500) NULL,
                     DOORDASH_MD5HASH_FILEPATH VARCHAR(500) NULL,
@@ -189,8 +191,10 @@ def init_db():
             _add_column_if_missing(cur, "requests", "merge_source_request_id", "BIGINT NULL")
             _add_column_if_missing(cur, "requests", "responder_match", "TINYINT(1) NOT NULL DEFAULT 0")
             _add_column_if_missing(cur, "requests", "responder_days", "INT NULL")
+            _add_column_if_missing(cur, "requests", "zip_radius", "INT NULL")
             for channel_name in _ALL_CHANNELS:
                 _add_column_if_missing(cur, "requests", channel_name + "_MERGE_STATUS", "VARCHAR(20) NULL")
+            _add_column_if_missing(cur, "requests", "ORANGE_MERGE_SOURCE_FILEPATH", "VARCHAR(500) NULL")
 
             _add_column_if_missing(cur, "requests", "APPTNESS_STATUS", "VARCHAR(50) NULL")
             _add_column_if_missing(cur, "requests", "APPTNESS_FTP", "VARCHAR(500) NULL")
@@ -395,13 +399,13 @@ def insert_request(record):
                     request_uuid, request_name, request_type, client_name,
                     created_by, criteria_type, comp_type, channel,
                     criteria_value, zip_file_path, criteria_json, merge_source_request_id,
-                    responder_match, responder_days,
+                    responder_match, responder_days, zip_radius,
                     output_dir, overall_status,
                     command_text, log_file, stdout_text, stderr_text,
                     return_code, started_at, finished_at,
                     GREEN_STATUS, BLUE_STATUS, ARCAMAX_STATUS, ORANGE_STATUS,
                     APPTNESS_STATUS
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
                     record["request_uuid"], record["request_name"], record["request_type"],
@@ -409,7 +413,8 @@ def insert_request(record):
                     record["comp_type"], channel_val, record.get("criteria_value"),
                     record.get("zip_file_path"), record.get("criteria_json"),
                     record.get("merge_source_request_id"), int(bool(record.get("responder_match"))),
-                    record.get("responder_days"), record["output_dir"], record["overall_status"],
+                    record.get("responder_days"), record.get("zip_radius"),
+                    record["output_dir"], record["overall_status"],
                     record.get("command_text"), record.get("log_file"),
                     record.get("stdout_text", ""), record.get("stderr_text", ""),
                     record.get("return_code"), record.get("started_at"), record.get("finished_at"),
@@ -594,7 +599,8 @@ def fetch_all_requests(limit=200, username=None):
                     r.DOORDASH_EMAIL_MERGE_STATUS, r.DOORDASH_MD5HASH_MERGE_STATUS,
                     r.criteria_json, r.responder_match, r.responder_days,
                     r.merge_source_request_id,
-                    merge_source.request_name AS merge_source_request_name
+                    merge_source.request_name AS merge_source_request_name,
+                    r.zip_radius
                 FROM requests r
                 JOIN users u ON u.id = r.created_by
                 LEFT JOIN requests merge_source ON merge_source.id = r.merge_source_request_id
@@ -658,6 +664,7 @@ def fetch_all_requests(limit=200, username=None):
                     "responder_days": row[56],
                     "merge_source_request_id": row[57],
                     "merge_source_request_name": row[58] or "",
+                    "zip_radius": row[59],
                 })
             return results
     finally:
@@ -813,7 +820,7 @@ def _fetch_notification_request(request_uuid):
                 SELECT r.id, r.request_name, r.client_name, r.request_type,
                        r.criteria_type, r.criteria_value, r.comp_type,
                        r.criteria_json, r.channel, r.output_dir,
-                       r.responder_match, r.responder_days,
+                       r.responder_match, r.responder_days, r.zip_radius,
                        r.merge_source_request_id, u.username,
                        source.request_name AS merge_source_request_name
                   FROM requests r
@@ -1270,6 +1277,9 @@ def submit_request():
     responder_match = form.get('responder_match') in {'1', 'true', 'on'}
     responder_days_raw = form.get('responder_days', '').strip()
     responder_days = None
+    zip_radius_enabled = form.get('zip_radius_enabled') in {'1', 'true', 'on'}
+    zip_radius_raw = form.get('zip_radius', '').strip()
+    zip_radius = None
 
     if responder_match:
         if not responder_days_raw.isdigit() or not 1 <= int(responder_days_raw) <= 120:
@@ -1312,24 +1322,36 @@ def submit_request():
         # so it cannot be routed into the non-DoorDash criteria processor.
         criteria_items = []
     if criteria_items:
-        allowed_criteria = {'age', 'state', 'zips', 'gender'}
+        allowed_criteria = {'age', 'state', 'zips'}
+        if any(not isinstance(item, dict) for item in criteria_items):
+            return jsonify({'ok': False, 'error': 'Criteria definition is invalid.'}), 400
         criteria_types = [item.get('type') for item in criteria_items]
-        if len(criteria_items) > 4 or len(set(criteria_types)) != len(criteria_types):
+        if len(criteria_items) > 3 or len(set(criteria_types)) != len(criteria_types):
             return jsonify({
                 'ok': False,
-                'error': 'Use each criterion only once: Age, State, ZIP, and Gender (maximum four).'
+                'error': 'Use each criterion only once: Age, State, and ZIP (maximum three).'
             }), 400
         invalid_criteria = [item for item in criteria_items if item.get('type') not in allowed_criteria]
         if invalid_criteria:
-            return jsonify({'ok': False, 'error': 'Criteria can use only Age, State, ZIP, or Gender.'}), 400
+            return jsonify({'ok': False, 'error': 'Criteria can use only Age, State, or ZIP.'}), 400
         if len(criteria_items) == 1:
             criteria_type = criteria_items[0].get('type', '')
             comp_type = criteria_items[0].get('comparison', '')
         else:
             criteria_type = 'multi'
             comp_type = 'include'
-    if criteria_type not in {'age', 'state', 'zips', 'gender', 'multi'}:
-        return jsonify({'ok': False, 'error': 'Criteria type must be age, state, ZIP, or gender.'}), 400
+    if criteria_type not in {'age', 'state', 'zips', 'multi'}:
+        return jsonify({'ok': False, 'error': 'Criteria type must be age, state, or ZIP.'}), 400
+
+    if zip_radius_enabled:
+        zip_selected = request_type == 'Doordash' or criteria_type == 'zips' or any(
+            item.get('type') == 'zips' for item in criteria_items
+        )
+        if not zip_selected:
+            return jsonify({'ok': False, 'error': 'ZIP Radius requires a ZIP criterion or a DoorDash request.'}), 400
+        if not zip_radius_raw.isdigit() or not 1 <= int(zip_radius_raw) <= 100:
+            return jsonify({'ok': False, 'error': 'ZIP Radius must be a whole number of miles between 1 and 100.'}), 400
+        zip_radius = int(zip_radius_raw)
 
     if not client_name:
         return jsonify({'ok': False, 'error': 'Client Name is required.'}), 400
@@ -1341,8 +1363,8 @@ def submit_request():
 
     if criteria_type == 'age' and comp_type not in {'greater', 'less', 'between'}:
         return jsonify({'ok': False, 'error': 'Age criteria requires comp type greater or less.'}), 400
-    if criteria_type in {'state', 'zips', 'gender'} and comp_type not in {'include', 'exclude'}:
-        return jsonify({'ok': False, 'error': 'State, ZIP, and Gender criteria require Include or Exclude.'}), 400
+    if criteria_type in {'state', 'zips'} and comp_type not in {'include', 'exclude'}:
+        return jsonify({'ok': False, 'error': 'State and ZIP criteria require Include or Exclude.'}), 400
 
     # Validate each channel
     valid_channels = {'ALL', 'GREEN', 'BLUE', 'ORANGE', 'ARCAMAX', 'APPTNESS'}
@@ -1367,10 +1389,9 @@ def submit_request():
                         return jsonify({'ok': False, 'error': 'Age value must be a number.'}), 400
                 else:
                     return jsonify({'ok': False, 'error': 'Age must be Greater Than, Lesser Than, or Between.'}), 400
-            elif item_type in {'state', 'gender'}:
+            elif item_type == 'state':
                 if item.get('comparison') not in {'include', 'exclude'} or not item.get('values'):
-                    label = 'Gender' if item_type == 'gender' else 'State'
-                    return jsonify({'ok': False, 'error': label + ' requires Include/Exclude and at least one value.'}), 400
+                    return jsonify({'ok': False, 'error': 'State requires Include/Exclude and at least one value.'}), 400
             elif item_type == 'zips' and item.get('comparison') not in {'include', 'exclude'}:
                 return jsonify({'ok': False, 'error': 'ZIP requires Include or Exclude.'}), 400
         if len(criteria_items) == 1:
@@ -1382,7 +1403,7 @@ def submit_request():
                     '{0},{1}'.format(item['from'], item['to'])
                     if comp_type == 'between' else str(item['value'])
                 )
-            elif criteria_type in {'state', 'gender'}:
+            elif criteria_type == 'state':
                 criteria_value = ','.join(item['values'])
             else:
                 criteria_value = None
@@ -1391,11 +1412,10 @@ def submit_request():
     elif criteria_type == 'age':
         if not criteria_value.isdigit():
             return jsonify({'ok': False, 'error': 'Valid age number is required.'}), 400
-    elif criteria_type in {'state', 'gender'}:
+    elif criteria_type == 'state':
         values = [s.strip() for s in criteria_value.split(',') if s.strip()]
         if not values:
-            label = 'Gender' if criteria_type == 'gender' else 'State'
-            return jsonify({'ok': False, 'error': 'At least one ' + label.lower() + ' value is required.'}), 400
+            return jsonify({'ok': False, 'error': 'At least one state value is required.'}), 400
         criteria_value = ','.join(s.upper() for s in values)
     else:
         criteria_value = None
@@ -1466,6 +1486,7 @@ def submit_request():
         "merge_source_request_id": merge_source_request_id,
         "responder_match": responder_match,
         "responder_days": responder_days,
+        "zip_radius": zip_radius,
         "output_dir":     output_dir,
         "overall_status": "inprogress",
         "command_text":   None,

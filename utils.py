@@ -4,6 +4,8 @@ Enhanced Utilities with Directory Safety + Run Isolation
 """
 
 import os
+import re
+import tempfile
 import json
 import time
 import gzip
@@ -63,8 +65,28 @@ def ensure_output_dir(output_dir, criteria_type):
 def run_command(cmd, cwd=None, timeout=3600, stdout=None):
     """Execute command with full error handling"""
     cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
-    logging.info(f"Running: {cmd_str}")
+    def redact(value):
+        return re.sub(
+            r"AWS_(?:KEY_ID|SECRET_KEY)\s*=\s*'[^']*'",
+            "AWS_CREDENTIAL='***'", str(value), flags=re.IGNORECASE,
+        )
+    logging.info("Running: %s", redact(cmd_str))
     start_time = time.time()
+
+    # Keep S3 COPY credentials out of the operating system process arguments.
+    # SnowSQL reads a private temporary SQL file with the same query instead.
+    query_path = None
+    if isinstance(cmd, list) and cmd and Path(cmd[0]).name == "snowsql" and "-q" in cmd:
+        query_index = cmd.index("-q")
+        if query_index + 1 < len(cmd) and re.search(
+            r"\bCREDENTIALS\s*=\s*\(", cmd[query_index + 1], re.IGNORECASE
+        ):
+            descriptor, query_path = tempfile.mkstemp(prefix="cpa_sql_", suffix=".sql")
+            with os.fdopen(descriptor, "w") as query_file:
+                query_file.write(cmd[query_index + 1].rstrip() + "\n")
+            os.chmod(query_path, 0o600)
+            cmd = (cmd[:query_index] + ["-f", query_path]
+                   + cmd[query_index + 2:] + ["-o", "echo=false"])
 
     try:
         result = subprocess.run(
@@ -82,13 +104,16 @@ def run_command(cmd, cwd=None, timeout=3600, stdout=None):
 
         if result.returncode != 0:
             raise RuntimeError(
-                f"Failed (code {result.returncode}):\n{result.stderr}"
+                f"Failed (code {result.returncode}):\n{redact(result.stderr)}"
             )
 
         return result.stdout.strip() if result.stdout else ""
 
     except subprocess.TimeoutExpired:
         raise TimeoutError(f"Timeout: {timeout}s")
+    finally:
+        if query_path:
+            os.unlink(query_path)
 
 
 def download_combine(s3_path, output_file, cwd):

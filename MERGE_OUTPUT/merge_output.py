@@ -14,6 +14,7 @@ import gzip
 import os
 import re
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -92,6 +93,37 @@ def _previous_path(previous_request_id, channel, log=None):
         conn.close()
 
 
+def _previous_orange_source(previous_request_id, log=None):
+    """Find the private ESP-aware source, falling back to legacy FINAL data.
+
+    Older Orange FINAL exports already contained account_name. New
+    Suppression FINAL exports contain only email, so their separate private
+    merge source must be preferred for all future merges.
+    """
+    conn = _db_connection(log)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT overall_status, ORANGE_FILEPATH, "
+                "ORANGE_MERGE_SOURCE_FILEPATH FROM requests WHERE id=%s",
+                (previous_request_id,),
+            )
+            row = cur.fetchone()
+            if not row or str(row[0]).lower() != "completed":
+                _trace(log, "previous Orange lookup returned no completed request",
+                       previous_request_id=previous_request_id,
+                       overall_status=(row[0] if row else "not found"))
+                return None
+            private_path = row[2] or row[1]
+            _trace(log, "previous Orange merge source resolved",
+                   previous_request_id=previous_request_id,
+                   source_type=("private" if row[2] else "legacy FINAL"),
+                   source_s3_path=(private_path or "not available"))
+            return private_path
+    finally:
+        conn.close()
+
+
 def _previous_doordash_path(previous_request_id, artifact, log=None):
     """Return a completed previous DoorDash Email/MD5 S3 path, if one exists."""
     path_column, _ = _DOORDASH_ARTIFACTS[artifact]
@@ -156,6 +188,24 @@ def _set_merge_status(request_id, channel, status, log=None):
         conn.close()
 
 
+def update_orange_merge_source_storage(request_id, s3_path, log=None):
+    """Persist the ESP-aware Orange source for a later Suppression/Mailing merge."""
+    if not _s3_prefix(s3_path):
+        raise ValueError("Orange merge source S3 path is required.")
+    conn = _db_connection(log)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE requests SET ORANGE_MERGE_SOURCE_FILEPATH=%s WHERE id=%s",
+                (s3_path, request_id),
+            )
+        conn.commit()
+        _trace(log, "Orange private merge source persisted",
+               request_id=request_id, s3_path=s3_path)
+    finally:
+        conn.close()
+
+
 def _set_doordash_storage(request_id, artifact, s3_path, merge_status, log=None):
     path_column, status_column = _DOORDASH_ARTIFACTS[artifact]
     _trace(log, "DoorDash merge storage update starting", request_id=request_id,
@@ -207,7 +257,8 @@ def _row_count(file_path, log=None):
 
 
 def _snowflake_merge(previous_s3, current_s3, merged_s3, channel, request_id,
-                     log, preserve_gender=False):
+                     log, preserve_gender=False, orange_public_s3=None,
+                     orange_suppression=False):
     """Merge two S3 exports in Snowflake and write a deduplicated export.
 
     The whole script must be one SnowSQL call: temporary stages and the
@@ -321,12 +372,129 @@ MAX_FILE_SIZE=490000000;
         staged_current=staged_current,
     )
 
+    if orange_public_s3:
+        if channel != "ORANGE" or preserve_gender:
+            raise ValueError("Separate public merge output supports only standard Orange requests.")
+        resolved_table = "CPA_MERGE_RESOLVED_{0}".format(merge_token)
+        public_columns = (
+            'email_address AS "email"' if orange_suppression
+            else 'email_address AS "email", account_name AS "accountname"'
+        )
+        # Older Orange FINAL files already have an ESP/account column. In case
+        # a legacy source has only email, first reuse a populated account from
+        # the other request and then look up its latest Orange ESP assignment.
+        # Keep the chosen previous email while filling its missing account.
+        sql_script = """
+CREATE OR REPLACE TEMPORARY STAGE {previous_stage}
+  URL='{previous_url}' {credentials};
+CREATE OR REPLACE TEMPORARY STAGE {current_stage}
+  URL='{current_url}' {credentials};
+CREATE OR REPLACE TEMPORARY TABLE {merge_table} (
+  email VARCHAR,
+  account_name VARCHAR,
+  gender VARCHAR,
+  source_order NUMBER
+);
+COPY INTO {merge_table} (email, account_name, gender, source_order)
+FROM ({staged_previous} FROM @{previous_stage})
+{load_format}
+ON_ERROR='ABORT_STATEMENT';
+COPY INTO {merge_table} (email, account_name, gender, source_order)
+FROM ({staged_current} FROM @{current_stage})
+{load_format}
+ON_ERROR='ABORT_STATEMENT';
+CREATE OR REPLACE TEMPORARY TABLE {resolved_table} AS
+WITH ranked AS (
+  SELECT email,
+         NULLIF(TRIM(account_name), '') AS account_name,
+         FIRST_VALUE(NULLIF(TRIM(account_name), '')) IGNORE NULLS OVER (
+           PARTITION BY LOWER(TRIM(email))
+           ORDER BY source_order, account_name, email
+           ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+         ) AS available_account,
+         ROW_NUMBER() OVER (
+           PARTITION BY LOWER(TRIM(email))
+           ORDER BY source_order,
+                    CASE WHEN NULLIF(TRIM(account_name), '') IS NULL THEN 1 ELSE 0 END,
+                    account_name, email
+         ) AS row_number
+  FROM {merge_table}
+  WHERE NULLIF(TRIM(email), '') IS NOT NULL
+), missing_accounts AS (
+  SELECT LOWER(TRIM(email)) AS email_key
+  FROM ranked
+  WHERE row_number=1 AND COALESCE(account_name, available_account) IS NULL
+), latest_esp AS (
+  SELECT LOWER(TRIM(orange.email_address)) AS email_key,
+         esp.ACCOUNT_NAME AS account_name,
+         ROW_NUMBER() OVER (
+           PARTITION BY LOWER(TRIM(orange.email_address))
+           ORDER BY orange.created_at DESC, esp.ACCOUNT_NAME
+         ) AS row_number
+  FROM APT_CUSTOM_ORANGE_TRANSACTION_DND orange
+  JOIN APT_ADHOC_JAIDEEP_ZIP_ESP_DETAILS_INCLUDE_ORANGE_20260604 esp
+    ON orange.FEED_ID=esp.FEEDID
+  JOIN missing_accounts missing
+    ON missing.email_key=LOWER(TRIM(orange.email_address))
+)
+SELECT ranked.email AS email_address,
+       COALESCE(ranked.account_name, ranked.available_account,
+                NULLIF(TRIM(latest_esp.account_name), '')) AS account_name
+FROM ranked
+LEFT JOIN latest_esp
+  ON latest_esp.email_key=LOWER(TRIM(ranked.email))
+ AND latest_esp.row_number=1
+WHERE ranked.row_number=1;
+COPY INTO '{merged_url}'
+FROM (SELECT email_address, account_name FROM {resolved_table})
+{credentials}
+{unload_format}
+HEADER=TRUE
+OVERWRITE=TRUE
+MAX_FILE_SIZE=490000000;
+COPY INTO '{public_url}'
+FROM (SELECT {public_columns} FROM {resolved_table})
+{credentials}
+{unload_format}
+HEADER=TRUE
+OVERWRITE=TRUE
+MAX_FILE_SIZE=490000000;
+""".format(
+            previous_stage=previous_stage,
+            current_stage=current_stage,
+            merge_table=merge_table,
+            resolved_table=resolved_table,
+            previous_url=_sql_literal(_s3_prefix(previous_s3) + "/"),
+            current_url=_sql_literal(_s3_prefix(current_s3) + "/"),
+            merged_url=_sql_literal(_s3_prefix(merged_s3) + "/"),
+            public_url=_sql_literal(_s3_prefix(orange_public_s3) + "/"),
+            public_columns=public_columns,
+            credentials=credentials,
+            load_format=load_format,
+            unload_format=unload_format,
+            staged_previous=staged_previous,
+            staged_current=staged_current,
+        )
+        _trace(log, "Orange private/public merge exports planned",
+               private_s3=merged_s3, public_s3=orange_public_s3,
+               public_columns=public_columns)
+
     log.info(
         "Snowflake merge started for %s: previous=%s, current=%s, output=%s",
         channel, previous_s3, current_s3, merged_s3,
     )
     log.info("Snowflake merge SQL (credentials redacted):\n%s", _redact_sql(sql_script))
-    run_command(["snowsql", "-c", "datateam1", "-q", sql_script])
+    sql_fd, sql_path = tempfile.mkstemp(prefix="cpa_merge_", suffix=".sql")
+    try:
+        os.fchmod(sql_fd, 0o600)
+        with os.fdopen(sql_fd, "w") as sql_file:
+            sql_file.write(sql_script)
+        run_command(["snowsql", "-c", "datateam1", "-f", sql_path])
+    finally:
+        try:
+            os.unlink(sql_path)
+        except FileNotFoundError:
+            pass
     log.info("Snowflake merge completed for %s", channel)
     _trace(log, "Snowflake merge command completed", channel=channel,
            merged_s3=_s3_prefix(merged_s3),
@@ -341,7 +509,7 @@ def _open_export_file(path):
 
 
 def _download_merged_export(merged_s3, current_file, channel, work_dir, log,
-                            preserve_gender=False):
+                            preserve_gender=False, require_account_name=False):
     """Stream merged S3 parts into the final local file without pandas."""
     current_file = Path(current_file)
     work_dir = Path(work_dir)
@@ -384,7 +552,15 @@ def _download_merged_export(merged_s3, current_file, channel, work_dir, log,
                 part_count = 0
                 with _open_export_file(source_path) as source:
                     reader = csv.reader(source, delimiter="|")
-                    next(reader, None)  # Snowflake writes a header in every part.
+                    header = next(reader, None)  # Snowflake writes a header in every part.
+                    if channel == "ORANGE" and require_account_name:
+                        columns = [str(name).strip().lstrip("\ufeff").lower()
+                                   for name in (header or [])]
+                        if len(columns) < 2 or columns[0] not in ("email", "email_address") or columns[1] not in ("account_name", "accountname"):
+                            raise RuntimeError(
+                                "Orange merged source must have email and "
+                                "ESP/account_name columns."
+                            )
                     for row in reader:
                         if not row:
                             continue
@@ -393,6 +569,11 @@ def _download_merged_export(merged_s3, current_file, channel, work_dir, log,
                                 row[0] if len(row) > 0 else "",
                                 row[1] if len(row) > 1 else "",
                             ]
+                            if require_account_name and not output_row[1].strip():
+                                raise RuntimeError(
+                                    "Orange merge could not resolve an ESP/account_name "
+                                    "for an email in the previous or current output."
+                                )
                             if preserve_gender:
                                 output_row.append(row[2] if len(row) > 2 else "")
                         else:
@@ -458,9 +639,32 @@ def _merge_to_current_file(previous_s3, current_s3_prefix, current_file,
     return count, merged_s3
 
 
+def _merge_orange_to_current_file(previous_s3, current_public_s3,
+                                  current_private_s3, current_file, request_type,
+                                  request_id, work_dir, log):
+    """Keep the Orange ESP-aware source while publishing the requested FINAL."""
+    merged_public_s3 = _merged_s3_path(current_public_s3, current_file)
+    # Mailing uses its two-column FINAL as the current private source. A
+    # different subfolder is essential even when the two input paths match.
+    merged_private_s3 = "{0}/MERGED_PRIVATE/{1}".format(
+        _s3_prefix(current_private_s3), _safe_identifier(Path(current_file).stem)
+    )
+    _snowflake_merge(
+        previous_s3, current_private_s3, merged_private_s3, "ORANGE",
+        request_id, log, orange_public_s3=merged_public_s3,
+        orange_suppression=str(request_type).lower() == "suppression",
+    )
+    count = _download_merged_export(
+        merged_private_s3, current_file, "ORANGE", work_dir, log,
+        require_account_name=True,
+    )
+    return count, merged_public_s3, merged_private_s3
+
+
 def merge_current_file(request_id, previous_request_id, channel, current_file,
                        current_s3_prefix, work_dir, log, orange=False,
-                       preserve_gender=False):
+                       preserve_gender=False, orange_merge_source_s3=None,
+                       request_type=None):
     """Merge one normal channel through Snowflake, or retain current output.
 
     Orange retains ``account_name`` in the merged file. The caller therefore
@@ -479,6 +683,45 @@ def merge_current_file(request_id, previous_request_id, channel, current_file,
            current_file=current_file, current_s3=_s3_prefix(current_s3_prefix),
            preserve_gender=preserve_gender)
     _verify_local_file(log, "current channel output before merge", current_file)
+    if channel == "ORANGE":
+        request_type = str(request_type or "").lower()
+        if request_type not in ("suppression", "mailing"):
+            raise ValueError("Orange merge requires the current request type.")
+        if request_type == "suppression" and not _s3_prefix(orange_merge_source_s3):
+            raise ValueError(
+                "Orange Suppression merge requires a private email/account_name export."
+            )
+        private_source_s3 = orange_merge_source_s3 or current_s3_prefix
+        previous_s3 = _previous_orange_source(previous_request_id, log)
+        if not previous_s3:
+            count = _row_count(current_file, log)
+            update_orange_merge_source_storage(request_id, private_source_s3, log)
+            _set_merge_status(request_id, channel, "CURRENT_ONLY", log)
+            return {
+                "merge_mode": "CURRENT_ONLY",
+                "count": count,
+                "s3_path": current_s3_prefix,
+                "orange_merge_source_s3": private_source_s3,
+            }
+        count, merged_public_s3, merged_private_s3 = _merge_orange_to_current_file(
+            previous_s3, current_s3_prefix, private_source_s3, current_file,
+            request_type, request_id, work_dir, log,
+        )
+        from REQUEST_PROCESSOR.request_processor import update_channel_storage
+        update_channel_storage(request_id, channel, merged_public_s3, count, log)
+        update_orange_merge_source_storage(request_id, merged_private_s3, log)
+        _set_merge_status(request_id, channel, "MERGED", log)
+        _trace(log, "Orange merge finalized", request_id=request_id,
+               previous_request_id=previous_request_id,
+               public_s3=merged_public_s3, private_s3=merged_private_s3,
+               row_count=count)
+        return {
+            "merge_mode": "MERGED",
+            "count": count,
+            "s3_path": merged_public_s3,
+            "orange_merge_source_s3": merged_private_s3,
+        }
+
     previous_s3 = _previous_path(previous_request_id, channel, log)
     if not previous_s3:
         count = _row_count(current_file, log)

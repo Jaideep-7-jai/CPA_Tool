@@ -22,12 +22,14 @@ CREATE TABLE IF NOT EXISTS requests (
     comp_type       VARCHAR(20) NOT NULL DEFAULT 'include',
     -- VARCHAR instead of ENUM so multi-channel strings like 'GREEN,ORANGE' are stored correctly
     channel         VARCHAR(100) NOT NULL DEFAULT 'ALL',
-    criteria_value  VARCHAR(500) NULL COMMENT 'legacy summary; criteria_json supports age/state/zips/gender combinations',
+    criteria_value  VARCHAR(500) NULL COMMENT 'legacy summary; criteria_json supports age/state/zips combinations',
     zip_file_path   VARCHAR(500) NULL,
     criteria_json   MEDIUMTEXT NULL,
     merge_source_request_id BIGINT NULL,
     responder_match TINYINT(1) NOT NULL DEFAULT 0,
     responder_days  INT NULL,
+    zip_radius      INT NULL COMMENT 'Optional ZIP match radius, 1 to 100 miles',
+    ORANGE_MERGE_SOURCE_FILEPATH VARCHAR(500) NULL,
     GREEN_MERGE_STATUS VARCHAR(20) NULL,
     BLUE_MERGE_STATUS VARCHAR(20) NULL,
     ARCAMAX_MERGE_STATUS VARCHAR(20) NULL,
@@ -79,6 +81,8 @@ ALTER TABLE requests ADD COLUMN IF NOT EXISTS criteria_json MEDIUMTEXT NULL;
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS merge_source_request_id BIGINT NULL;
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS responder_match TINYINT(1) NOT NULL DEFAULT 0;
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS responder_days INT NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS zip_radius INT NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS ORANGE_MERGE_SOURCE_FILEPATH VARCHAR(500) NULL;
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS GREEN_MERGE_STATUS VARCHAR(20) NULL;
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS BLUE_MERGE_STATUS VARCHAR(20) NULL;
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS ARCAMAX_MERGE_STATUS VARCHAR(20) NULL;
