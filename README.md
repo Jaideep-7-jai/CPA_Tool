@@ -10,7 +10,7 @@ request and separate modules for DoorDash and previous-output merging.
 | --- | --- |
 | `app.py` | Validates the form, saves the request/criteria in MySQL, and starts `main.py` in the background. |
 | `main.py` | Routes DoorDash requests to the DoorDash processor; routes every Suppression/Mailing request to the consolidated processor. |
-| `REQUEST_PROCESSOR/request_processor.py` | Main non-DoorDash engine. Handles one or many Age, State, and ZIP criteria using OR logic, responder match, S3 exports, optional merge, Orange ESP output, FTP delivery, and detailed logs. |
+| `REQUEST_PROCESSOR/request_processor.py` | Main non-DoorDash engine. Handles one or many Age, State, ZIP, and Gender criteria using OR logic, responder match, S3 exports, optional merge, Orange ESP output, FTP delivery, and detailed logs. |
 | `REQUEST_PROCESSOR/zip_radius.py` | Expands a selected ZIP file by up to 100 miles using the separate `snowflake` SnowSQL connection, then loads the expanded ZIP list into the normal `datateam1` staging table. |
 | `Doordash/doordash_zips.py` | DoorDash ZIP workflow. It imports only common low-level helpers from the consolidated processor and does not depend on a `ZIPS` module. |
 | `MERGE_OUTPUT/merge_output.py` | Merges compatible current/previous S3 files in Snowflake so large files are never loaded into pandas. |
@@ -20,8 +20,9 @@ The old `AGE_STATE`, `ZIPS`, and `MULTI_CRITERIA` runtime modules are retired.
 
 ## Request routing
 
-1. The UI builds `criteria_json` from selected Age, State, and/or ZIP
-   rows. A criterion can be selected once; matching uses OR logic.
+1. The UI builds `criteria_json` from selected Age, State, ZIP, and/or Gender
+   rows. A criterion can be selected once; matching uses OR logic. Gender
+   accepts exactly one choice, Male or Female.
 2. `app.py` validates request/client-name uniqueness, responder days, ZIP radius,
    optional merge eligibility, criteria values, channels, and ZIP uploads.
 3. `main.py` receives the saved request ID.
@@ -45,7 +46,7 @@ For a non-DoorDash request the processor:
    Blue uses `CHANNELNAME='ORANGE'` in `RAW_OPENS_FOLLOWUP`.
 5. Exports FINAL and COMPLETE datasets to S3, then drops temporary Snowflake
    tables. COMPLETE carries `email` plus each selected criterion field in
-   selection order: `age`, `state`, and/or `zip`. Orange COMPLETE inserts
+   selection order: `age`, `state`, `zip`, and/or `gender`. Orange COMPLETE inserts
    `accountname` immediately after `email`.
 6. Downloads the final data, optionally merges a compatible previous request
    in Snowflake, then writes delivery artifacts.
@@ -56,6 +57,9 @@ For a non-DoorDash request the processor:
    public Suppression FINAL contains only email.
 8. Posts deliverables to FTP, stores S3/FTP/count metadata, updates status,
    sends notification, and removes temporary files/tables.
+
+DoorDash posts ZIP archives only for the combined email and MD5 outputs and
+Orange. The generated CSV data remains available in S3 for later merges.
 
 Every major action is logged in the request's `logs/` directory.
 
@@ -70,6 +74,11 @@ connection with SELECT access to
 working schema. ZIP lists are loaded to that connection, expanded and
 unloaded to S3, then loaded into the normal `datateam1` ZIP staging table.
 The source ZIPs are retained even when no zero-mile distance row exists.
+The radius connection uses its own SnowSQL credentials. If its private key
+requires a passphrase, set `CPA_ZIP_RADIUS_SNOWSQL_PASSPHRASE` to that key's
+passphrase. If `snowsql -c snowflake` works without one, leave this variable
+unset; the processor clears the inherited `datateam1` passphrase for radius
+queries. Keep the normal `SNOWSQL_PASSPHRASE` for `datateam1` queries.
 
 ## Runtime configuration
 
@@ -89,7 +98,8 @@ export CPA_EMAIL_TECH_RECIPIENTS='…'
 export CPA_EMAIL_DATATEAM_RECIPIENTS='…'
 export CPA_EMAIL_CPA_RECIPIENTS='…'
 export CPA_EMAIL_CPA_USERNAMES='cpauser'
-export CPA_ZIP_RADIUS_SNOWSQL_PASSPHRASE='…'
+# Only if the snowflake connection requires its own private-key passphrase:
+# export CPA_ZIP_RADIUS_SNOWSQL_PASSPHRASE='…'
 export CPA_ZIP_RADIUS_AWS_KEY_ID='…'
 export CPA_ZIP_RADIUS_AWS_SECRET_KEY='…'
 ```
@@ -98,7 +108,7 @@ export CPA_ZIP_RADIUS_AWS_SECRET_KEY='…'
 
 Every completion/failure message includes a request-details table with request
 name, client name, request type, criteria/value/comparison, channels, responder
-match days, and merge source.  Error e-mails contain a short exit reason and a
+match days, requested ZIP radius, and merge source. Error e-mails contain a short exit reason and a
 support-log location rather than embedding the full log.
 
 `CPA_EMAIL_CPA_USERNAMES` controls the FTP-only recipient view.  Those users
@@ -135,6 +145,7 @@ python3.9 -m py_compile \
   MERGE_OUTPUT/merge_output.py
 
 node --check static/request-form.js
+python3 -m unittest discover -s tests -v
 git diff --check
 ```
 

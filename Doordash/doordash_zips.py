@@ -4,6 +4,7 @@
 import os
 import time
 import shutil
+import zipfile
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,6 +37,33 @@ from REQUEST_PROCESSOR.request_processor import (
 
 CHANNELS = ["GREEN", "BLUE", "APPTNESS", "ARCAMAX", "ORANGE"]
 COMBINED_CHANNELS = ["GREEN", "BLUE", "APPTNESS", "ARCAMAX"]
+
+
+def _archive_delivery_csv(csv_path, log):
+    """Build one ZIP64 archive for FTP while retaining the CSV for S3 merges."""
+    csv_path = Path(csv_path)
+    _verify_local_file(log, "DoorDash CSV before ZIP delivery", csv_path)
+    zip_path = csv_path.with_suffix(".zip")
+    temporary_zip = zip_path.with_name(zip_path.name + ".tmp")
+    try:
+        with zipfile.ZipFile(str(temporary_zip), "w", zipfile.ZIP_DEFLATED,
+                             allowZip64=True) as archive:
+            archive.write(str(csv_path), arcname=csv_path.name)
+        with zipfile.ZipFile(str(temporary_zip), "r") as archive:
+            members = archive.infolist()
+            if len(members) != 1 or members[0].filename != csv_path.name:
+                raise RuntimeError("DoorDash ZIP does not contain the expected CSV.")
+            if members[0].file_size != csv_path.stat().st_size:
+                raise RuntimeError("DoorDash ZIP CSV size differs from its source.")
+        os.replace(str(temporary_zip), str(zip_path))
+    finally:
+        if temporary_zip.exists():
+            temporary_zip.unlink()
+    _verify_local_file(log, "DoorDash ZIP delivery file", zip_path)
+    _trace(log, "DoorDash ZIP delivery prepared", archive=zip_path,
+           member=csv_path.name, member_bytes=csv_path.stat().st_size,
+           archive_bytes=zip_path.stat().st_size)
+    return zip_path
 
 
 def _insert_apptness_into_perm_table(perm_table, zip_staging_table, comp_type, log):
@@ -247,7 +275,7 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
             _trace(log, "combined MD5 export completed", destination=md5_s3)
             md5_line_count = _download_and_combine(
                 md5_s3, run_dir / "MD5_FINAL_DL", run_dir / "MD5_FINAL_TMP",
-                md5_name, "GREEN", log,
+                md5_name, "GREEN", log, final_header=["md5hash"],
             )
             md5_count = max(md5_line_count - 1, 0)
             _verify_local_file(log, "combined DoorDash MD5 file",
@@ -288,20 +316,25 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
     else:
         _trace(log, "DoorDash email merge skipped",
                reason="merge_source_request_id is NULL")
-    email_ftp_path = _post_to_ftp(final_files_dir, path_date, email_name, log, request_type=request_type)
+    email_zip = _archive_delivery_csv(email_dest, log)
+    email_ftp_path = _post_to_ftp(
+        final_files_dir, path_date, email_zip.name, log, request_type=request_type
+    )
     _trace(log, "DoorDash email FTP validated", ftp_path=email_ftp_path,
            email_count=email_count, merge_mode=email_merge_mode)
+    email_dest.unlink()
     shutil.rmtree(str(run_dir / "EMAIL_FINAL_TMP"), ignore_errors=True)
     outputs = [{
-        "channel": "DOORDASH_EMAIL", "file": email_name,
-        "final_file_path": str(email_dest), "status": "SUCCESS",
+        "channel": "DOORDASH_EMAIL", "file": email_zip.name,
+        "final_file_path": str(email_zip), "status": "SUCCESS",
         "count": email_count, "s3_path": email_s3,
         "final_s3_path": email_s3, "final_data_header": "email",
         "final_count": email_count,
         "complete_s3_path": " | ".join(complete_paths),
         "complete_data_header": "email|ZIP (per source channel)",
         "complete_count": complete_count,
-        "ftp_path": email_ftp_path, "delivery_header": "email",
+        "ftp_path": email_ftp_path,
+        "delivery_header": "ZIP archive (inner CSV header: email)",
         "merge_mode": email_merge_mode,
         "merge_source_request_id": request_data.get("merge_source_request_id") or "",
         "merge_source_request_name": request_data.get("merge_source_request_name") or "",
@@ -328,20 +361,26 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
         else:
             _trace(log, "DoorDash MD5 merge skipped",
                    reason="merge_source_request_id is NULL")
-        md5_ftp_path = _post_to_ftp(final_files_dir, path_date, md5_name, log, request_type=request_type)
+        md5_zip = _archive_delivery_csv(md5_dest, log)
+        md5_ftp_path = _post_to_ftp(
+            final_files_dir, path_date, md5_zip.name, log,
+            request_type=request_type,
+        )
         _trace(log, "DoorDash MD5 FTP validated", ftp_path=md5_ftp_path,
                md5_count=md5_count, merge_mode=md5_merge_mode)
+        md5_dest.unlink()
         shutil.rmtree(str(run_dir / "MD5_FINAL_TMP"), ignore_errors=True)
         outputs.append({
-            "channel": "DOORDASH_ARCAMAX_MD5", "file": md5_name,
-            "final_file_path": str(md5_dest), "status": "SUCCESS",
+            "channel": "DOORDASH_ARCAMAX_MD5", "file": md5_zip.name,
+            "final_file_path": str(md5_zip), "status": "SUCCESS",
             "count": md5_count, "s3_path": md5_s3,
             "final_s3_path": md5_s3, "final_data_header": "md5hash",
             "final_count": md5_count,
             "complete_s3_path": " | ".join(complete_paths),
             "complete_data_header": "email|ZIP (per source channel)",
             "complete_count": complete_count,
-            "ftp_path": md5_ftp_path, "delivery_header": "md5hash",
+            "ftp_path": md5_ftp_path,
+            "delivery_header": "ZIP archive (inner CSV header: md5hash)",
             "merge_mode": md5_merge_mode,
             "merge_source_request_id": request_data.get("merge_source_request_id") or "",
             "merge_source_request_name": request_data.get("merge_source_request_name") or "",

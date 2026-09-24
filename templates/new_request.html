@@ -61,6 +61,7 @@
           <option value="age">🎂 Age</option>
           <option value="state">🗺️ State</option>
           <option value="zips">📮 Zips</option>
+          <option value="gender">Gender</option>
         </select>
       </div>
 
@@ -92,7 +93,7 @@
           <i class="bi bi-plus-lg"></i> Add Criteria
         </button>
         <input type="hidden" name="criteria_json" id="criteria_json">
-        <small>Use Age, State, or ZIP once each. Matching any selected criterion includes the record.</small>
+        <small>Use Age, State, ZIP, or Gender once each. Choose Male or Female for Gender. Matching any selected criterion includes the record.</small>
       </div>
 
       <!-- ZIP radius applies to an uploaded ZIP criterion or DoorDash ZIP request. -->
@@ -218,7 +219,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='request-form.js') }}?v=20260923-zip-radius" defer></script>
+<script src="{{ url_for('static', filename='request-form.js') }}?v=20260925-gender" defer></script>
 <script>
 // Sync checkbox → visual "checked" class
 document.querySelectorAll('.channel-option').forEach(lbl => {

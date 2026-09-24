@@ -150,13 +150,13 @@ document.addEventListener('DOMContentLoaded', () => {
     mergeSourceCheckTimer = setTimeout(checkMergeSource, 400);
   }
 
-  const supportedCriteria = ['age', 'state', 'zips'];
+  const supportedCriteria = ['age', 'state', 'zips', 'gender'];
 
   function criterionOptions(selected) {
     return supportedCriteria.map(type => {
       const label = type === 'age' ? 'Age'
         : type === 'state' ? 'State'
-          : 'ZIP';
+          : type === 'zips' ? 'ZIP' : 'Gender';
       return `<option value="${type}" ${type === selected ? 'selected' : ''}>${label}</option>`;
     }).join('');
   }
@@ -174,6 +174,9 @@ document.addEventListener('DOMContentLoaded', () => {
       } else if (type === 'state') {
         item.values = row.querySelector('.criteria-value').value
           .split(',').map(value => value.trim()).filter(Boolean);
+      } else if (type === 'gender') {
+        const gender = row.querySelector('.criteria-value').value;
+        item.values = gender ? [gender] : [];
       }
       return item;
     });
@@ -193,6 +196,9 @@ document.addEventListener('DOMContentLoaded', () => {
     } else if (type === 'state') {
       comparison.innerHTML = '<option value="include">Include</option><option value="exclude">Exclude</option>';
       valueWrap.innerHTML = '<input class="criteria-value" type="text" placeholder="CA, TX, NY">';
+    } else if (type === 'gender') {
+      comparison.innerHTML = '<option value="include">Include</option>';
+      valueWrap.innerHTML = '<select class="criteria-value"><option value="">-- Select Gender --</option><option value="MALE">Male</option><option value="FEMALE">Female</option></select>';
     } else {
       comparison.innerHTML = '<option value="include">Include</option><option value="exclude">Exclude</option>';
       valueWrap.innerHTML = '<input type="file" name="zip_file" class="criteria-zip-file" accept=".csv,.txt"><span class="criteria-file-name">Upload ZIP file</span>';

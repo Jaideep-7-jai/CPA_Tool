@@ -103,8 +103,14 @@ def run_command(cmd, cwd=None, timeout=3600, stdout=None):
         logging.info(f"Completed: {elapsed:.1f}s (code: {result.returncode})")
 
         if result.returncode != 0:
+            # SnowSQL may print compilation errors to stdout, leaving stderr
+            # empty even when exit_on_error=true. Include both streams so the
+            # request's short failure message contains the real SQL reason.
+            failure_output = redact("\n".join(filter(None, (
+                result.stderr, result.stdout,
+            )))).strip()
             raise RuntimeError(
-                f"Failed (code {result.returncode}):\n{redact(result.stderr)}"
+                f"Failed (code {result.returncode}):\n{failure_output[-4000:]}"
             )
 
         return result.stdout.strip() if result.stdout else ""
@@ -531,7 +537,7 @@ def _request_detail_rows(request_details):
         )
     else:
         merge = "No"
-    return [
+    rows = [
         ("Request Name", request_details.get("request_name") or "-"),
         ("Client Name", request_details.get("client_name") or "-"),
         ("Request Type", request_details.get("request_type") or "-"),
@@ -542,6 +548,10 @@ def _request_detail_rows(request_details):
         ("Responder Match", responder),
         ("Merge Previous Output", merge),
     ]
+    radius = request_details.get("zip_radius")
+    if radius not in (None, "", 0, "0"):
+        rows.insert(-1, ("ZIP Radius", "{0} mile(s)".format(radius)))
+    return rows
 
 
 def _request_summary(request_details):
@@ -600,7 +610,16 @@ def _short_error_reason(error_msg, max_length=360):
         if cleaned.startswith("^"):
             continue
         candidates.append(cleaned)
-    reason = " ".join(candidates) if candidates else text.strip()
+    # A Python traceback ends with the useful exception line. Do not prepend
+    # stack frames or lengthy SnowSQL progress output to the emailed reason.
+    exception_lines = [line for line in candidates if re.match(
+        r"^(?:[A-Za-z_][\w.]*Error|Exception):\s*.+", line
+    )]
+    reason = exception_lines[-1].split(":", 1)[1].strip() if exception_lines else (
+        candidates[-1] if candidates else text.strip()
+    )
+    if reason.endswith(":") and exception_lines and candidates[-1] != exception_lines[-1]:
+        reason += " " + candidates[-1]
     reason = " ".join(reason.split())
     if len(reason) > max_length:
         reason = reason[:max_length - 1].rstrip() + "…"

@@ -3,7 +3,7 @@
 Consolidated criteria processor for Suppression and Mailing requests.
 
 This module owns the complete non-DoorDash processing path for Age, State,
-ZIP, and any supported combination of those criteria. It replaces
+ZIP, Gender, and any supported combination of those criteria. It replaces
 the old AGE_STATE, ZIPS, and MULTI_CRITERIA runtime routes. DoorDash imports
 the shared low-level helpers it needs from here, but retains its own workflow.
 
@@ -1439,11 +1439,10 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
             _verify_local_file(log, "ORANGE mailing ZIP", final_file_path)
             log.info(f"  STEP 6 DONE: Mailing ESP ZIP created -> {final_file_path}")
             if legacy_doordash_output:
-                # DoorDash still uses its established ORANGE full-output path.
-                supp_file = final_files_dir / ctx["output_file"]
-                shutil.copy(str(combined_path), str(supp_file))
-                _verify_local_file(log, "DoorDash ORANGE CSV", supp_file)
-                log.info(f"  DoorDash ORANGE CSV retained -> {supp_file}")
+                # The raw CSV is already retained in S3 for audit/merge.
+                # FINAL_FILES contains delivery artifacts only.
+                _trace(log, "DoorDash Orange raw data retained in S3",
+                       s3_prefix=path_FINAL, delivery_zip=output_file)
 
         _cleanup_channel_tmp(channel_tmp, log)
 
@@ -1451,7 +1450,8 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
         _step(log, 7, TOTAL_STEPS, f"FTP upload -> {output_file}", channel_name)
         update_request_status(request_id, "Posting To FTP", channel_status, log)
         if legacy_doordash_output:
-            _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
+            _trace(log, "DoorDash Orange ZIP-only FTP delivery",
+                   zip_filename=output_file)
         ftp_path = _post_to_ftp(final_files_dir, ctx["path_date"], output_file, log)
         update_ftp_path(request_id, channel_name, ftp_path, log, record_count)
         log.info(f"  STEP 7 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path}")
@@ -1731,7 +1731,7 @@ def _post_to_ftp(final_files_dir, path_date, output_file, log, request_type=None
 # process_request() below, regardless of whether they contain one criterion or
 # a mixture of Age, State, and ZIP criteria.
 
-CONSOLIDATED_CRITERIA = ("age", "state", "zips")
+CONSOLIDATED_CRITERIA = ("age", "state", "zips", "gender")
 
 
 def _safe_identifier(value):
@@ -1746,7 +1746,7 @@ def _safe_sql_identifier(value, label):
 
 
 def _criterion_values(item):
-    """Return cleaned State values."""
+    """Return cleaned State or Gender values."""
     values = item.get("values")
     if values is None:
         values = item.get("value", "")
@@ -1804,7 +1804,7 @@ def _criteria_from_request(request_data):
             else:
                 criteria = [{"type": "age", "comparison": comparison,
                              "value": str(value)}]
-        elif criteria_type == "state":
+        elif criteria_type in ("state", "gender"):
             criteria = [{"type": criteria_type, "comparison": comparison,
                          "values": [part.strip() for part in str(value).split(",")
                                     if part.strip()]}]
@@ -1817,7 +1817,7 @@ def _criteria_from_request(request_data):
     if not isinstance(criteria, list) or not criteria:
         raise ValueError("At least one criterion is required.")
     if len(criteria) > len(CONSOLIDATED_CRITERIA):
-        raise ValueError("A request can contain at most Age, State, and ZIP.")
+        raise ValueError("A request can contain at most Age, State, ZIP, and Gender.")
 
     normalised = []
     seen = set()
@@ -1858,6 +1858,10 @@ def _criteria_from_request(request_data):
                     "{0} requires Include/Exclude and at least one value."
                     .format(item_type.title())
                 )
+        elif item_type == "gender":
+            item["values"] = _criterion_values(item)
+            if comparison != "include" or len(item["values"]) != 1 or item["values"][0] not in ("MALE", "FEMALE"):
+                raise ValueError("Gender requires Include and exactly one choice: MALE or FEMALE.")
         elif item_type == "zips":
             if comparison not in ("include", "exclude"):
                 raise ValueError("ZIP supports Include or Exclude.")
@@ -1868,12 +1872,75 @@ def _criteria_from_request(request_data):
 def _column_map(channel):
     channel = str(channel).upper()
     if channel in ("GREEN", "BLUE"):
-        return {"age": "b.AGE", "state": "b.STATE", "zips": "b.ZIP"}
+        # BLUE joins the same DND table as GREEN; its profile selects the email.
+        return {"age": "b.AGE", "state": "b.STATE", "zips": "b.ZIP",
+                "gender": "b.GENDER"}
     if channel == "ARCAMAX":
-        return {"age": "birthday", "state": "STATE", "zips": "ZIP"}
+        return {"age": "a.birthday", "state": "a.STATE", "zips": "a.ZIP",
+                "gender": "g.gender"}
     if channel == "ORANGE":
-        return {"age": "a.dob", "state": "a.STATE", "zips": "a.ZIP"}
+        return {"age": "a.dob", "state": "a.STATE", "zips": "a.ZIP",
+                "gender": "a.GENDER"}
     raise ValueError("Unsupported channel: {0}".format(channel))
+
+
+def _gender_expression(channel):
+    """Normalize M/F and Male/Female source values to one audit value."""
+    column = _column_map(channel)["gender"]
+    return (
+        "CASE UPPER(TRIM(TO_VARCHAR({0}))) "
+        "WHEN 'M' THEN 'MALE' WHEN 'MALE' THEN 'MALE' "
+        "WHEN 'F' THEN 'FEMALE' WHEN 'FEMALE' THEN 'FEMALE' "
+        "ELSE NULL END"
+    ).format(column)
+
+
+def _arcamax_gender_join(log):
+    """Join the verified Arcamax SEX source using a discovered email key.
+
+    The Arcamax birthday/state/ZIP source is not the table in the supplied SEX
+    screenshot. Discover the key in Snowflake metadata so an unexpected schema
+    fails clearly instead of silently matching on a guessed column.
+    """
+    table = "APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE_DND_SF"
+    metadata_sql = (
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_CATALOG=CURRENT_DATABASE() "
+        "AND TABLE_SCHEMA=CURRENT_SCHEMA() "
+        "AND TABLE_NAME='{0}' "
+        "AND COLUMN_NAME IN ('EMAIL', 'EMAILID', 'EMAIL_ADDRESS') "
+        "ORDER BY CASE COLUMN_NAME WHEN 'EMAIL' THEN 1 "
+        "WHEN 'EMAILID' THEN 2 ELSE 3 END"
+    ).format(table)
+    output = run_command([
+        "snowsql", "-c", "datateam1", "-q", metadata_sql,
+        "-o", "output_format=csv", "-o", "header=false",
+        "-o", "timing=false", "-o", "friendly=false", "-o", "exit_on_error=true",
+    ])
+    candidates = [line.strip().strip('"').upper() for line in output.splitlines()]
+    email_key = next((name for name in candidates
+                      if name in ("EMAIL", "EMAILID", "EMAIL_ADDRESS")), None)
+    if not email_key:
+        raise RuntimeError(
+            "Arcamax Gender source {0} has no verified EMAIL, EMAILID or "
+            "EMAIL_ADDRESS column in the current Snowflake schema."
+            .format(table)
+        )
+    _trace(log, "Arcamax Gender join key verified", table=table, email_key=email_key,
+           conflict_rule="different SEX values for the same email become NULL")
+    return (
+        "LEFT JOIN (SELECT email_key, "
+        "IFF(MIN(gender_value)=MAX(gender_value), MIN(gender_value), NULL) AS gender "
+        "FROM (SELECT LOWER(TRIM(TO_VARCHAR({key}))) AS email_key, "
+        "CASE UPPER(TRIM(TO_VARCHAR(SEX))) "
+        "WHEN 'M' THEN 'MALE' WHEN 'MALE' THEN 'MALE' "
+        "WHEN 'F' THEN 'FEMALE' WHEN 'FEMALE' THEN 'FEMALE' "
+        "ELSE NULL END AS gender_value "
+        "FROM {table} WHERE UPPER(TRIM(TO_VARCHAR(SEX))) "
+        "IN ('M','MALE','F','FEMALE')) gender_records "
+        "WHERE email_key <> '' GROUP BY email_key) g "
+        "ON LOWER(TRIM(TO_VARCHAR(a.email)))=g.email_key "
+    ).format(key=email_key, table=table)
 
 
 def _age_expression(channel):
@@ -1919,6 +1986,11 @@ def _criteria_predicate(channel, criteria, zip_staging_table, log):
                     ",".join("'{0}'".format(value) for value in values)
                 )
             )
+        elif item_type == "gender":
+            # Validation above restricts this SQL literal to MALE/FEMALE.
+            conditions.append("{0} = '{1}'".format(
+                _gender_expression(channel), item["values"][0]
+            ))
         elif item_type == "zips":
             if not zip_staging_table:
                 raise ValueError("ZIP criterion requires a populated ZIP staging table.")
@@ -1947,9 +2019,15 @@ def _create_criteria_channel_table(perm_table, channel, criteria,
     selected = {item["type"] for item in criteria}
     columns = _column_map(channel)
     output_columns = []
-    for kind, alias in (("age", "AGE"), ("state", "STATE"), ("zips", "ZIP")):
+    for kind, alias in (("age", "AGE"), ("state", "STATE"),
+                        ("zips", "ZIP"), ("gender", "GENDER")):
         if kind in selected:
-            value = _age_expression(channel) if kind == "age" else columns[kind]
+            if kind == "age":
+                value = _age_expression(channel)
+            elif kind == "gender":
+                value = _gender_expression(channel)
+            else:
+                value = columns[kind]
             output_columns.append("{0} AS {1}".format(value, alias))
     selected_columns = ", " + ", ".join(output_columns)
     if channel in ("GREEN", "BLUE"):
@@ -1966,11 +2044,13 @@ def _create_criteria_channel_table(perm_table, channel, criteria,
                  responder_join=responder_join, predicate=predicate,
                  selected_columns=selected_columns)
     elif channel == "ARCAMAX":
+        gender_join = _arcamax_gender_join(log) if "gender" in selected else ""
         sql = (
             "CREATE OR REPLACE TABLE {perm} AS "
-            "SELECT email{selected_columns} FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
+            "SELECT a.email{selected_columns} FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE a "
+            "{gender_join}"
             "WHERE {predicate};"
-        ).format(perm=perm_table, predicate=predicate,
+        ).format(perm=perm_table, gender_join=gender_join, predicate=predicate,
                  selected_columns=selected_columns)
     else:
         sql = (

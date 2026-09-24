@@ -3,7 +3,7 @@
 
 All Suppression and Mailing requests use the consolidated criteria processor,
 regardless of whether they use one criterion or a combination of Age, State,
-and ZIP.  DoorDash remains a dedicated ZIP workflow.
+ZIP, and Gender.  DoorDash remains a dedicated ZIP workflow.
 """
 
 import argparse
@@ -20,7 +20,7 @@ def parse_args():
                         choices=["Suppression", "Mailing", "Doordash"],
                         help="Type of request")
     parser.add_argument("--criteria-type", required=True,
-                        choices=["age", "state", "zips", "multi"],
+                        choices=["age", "state", "zips", "gender", "multi"],
                         help="Criteria type")
     parser.add_argument("--comp-type",     required=True,
                         choices=["greater", "less", "between", "include", "exclude"],

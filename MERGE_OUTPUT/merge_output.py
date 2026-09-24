@@ -281,7 +281,9 @@ def _snowflake_merge(previous_s3, current_s3, merged_s3, channel, request_id,
             "$3::VARCHAR" if preserve_gender else "NULL::VARCHAR"
         )
     else:
-        output_columns = "email" + (", gender" if preserve_gender else "")
+        output_columns = (
+            'email AS "md5hash"' if channel == "DOORDASH_MD5HASH" else "email"
+        ) + (", gender" if preserve_gender else "")
         staged_previous = "SELECT $1::VARCHAR, NULL::VARCHAR, {0}, 1".format(
             "$2::VARCHAR" if preserve_gender else "NULL::VARCHAR"
         )
@@ -489,7 +491,13 @@ MAX_FILE_SIZE=490000000;
         os.fchmod(sql_fd, 0o600)
         with os.fdopen(sql_fd, "w") as sql_file:
             sql_file.write(sql_script)
-        run_command(["snowsql", "-c", "datateam1", "-f", sql_path])
+        # SnowSQL normally continues after a SQL statement fails, and can
+        # return success even though COPY INTO produced no files. Preserve
+        # the actual Snowflake error so it can be diagnosed from the job log.
+        run_command([
+            "snowsql", "-c", "datateam1", "-f", sql_path,
+            "-o", "exit_on_error=true", "-o", "echo=false",
+        ])
     finally:
         try:
             os.unlink(sql_path)
@@ -527,7 +535,10 @@ def _download_merged_export(merged_s3, current_file, channel, work_dir, log,
             "aws", "s3", "cp", _s3_prefix(merged_s3) + "/", str(download_dir),
             "--recursive", "--quiet",
         ])
-        source_files = sorted(path for path in download_dir.rglob("*") if path.is_file())
+        source_files = sorted(
+            path for path in download_dir.rglob("*")
+            if path.is_file() and path.name.lower().endswith((".csv", ".csv.gz"))
+        )
         if not source_files:
             raise RuntimeError("No merged files were downloaded from {0}".format(merged_s3))
         _trace(log, "merged export parts downloaded", channel=channel,
@@ -542,6 +553,8 @@ def _download_merged_export(merged_s3, current_file, channel, work_dir, log,
             writer = csv.writer(destination, delimiter="|", lineterminator="\n")
             if channel == "ORANGE":
                 header = ["email_address", "account_name"]
+            elif channel == "DOORDASH_MD5HASH":
+                header = ["md5hash"]
             else:
                 header = ["email"]
             if preserve_gender:
@@ -553,14 +566,18 @@ def _download_merged_export(merged_s3, current_file, channel, work_dir, log,
                 with _open_export_file(source_path) as source:
                     reader = csv.reader(source, delimiter="|")
                     header = next(reader, None)  # Snowflake writes a header in every part.
+                    columns = [str(name).strip().lstrip("\ufeff").lower()
+                               for name in (header or [])]
                     if channel == "ORANGE" and require_account_name:
-                        columns = [str(name).strip().lstrip("\ufeff").lower()
-                                   for name in (header or [])]
                         if len(columns) < 2 or columns[0] not in ("email", "email_address") or columns[1] not in ("account_name", "accountname"):
                             raise RuntimeError(
                                 "Orange merged source must have email and "
                                 "ESP/account_name columns."
                             )
+                    elif channel == "DOORDASH_MD5HASH" and columns != ["md5hash"]:
+                        raise RuntimeError(
+                            "DoorDash MD5 merged export must have a md5hash column."
+                        )
                     for row in reader:
                         if not row:
                             continue
@@ -612,9 +629,11 @@ def _download_merged_export(merged_s3, current_file, channel, work_dir, log,
 
 
 def _merged_s3_path(current_s3_prefix, current_file):
-    """Use a request-specific folder so retry data cannot be mixed in."""
-    return "{0}/MERGED/{1}".format(
-        _s3_prefix(current_s3_prefix), _safe_identifier(Path(current_file).stem)
+    """Keep merged data outside the input stage to avoid recursive reloads."""
+    input_prefix = _s3_prefix(current_s3_prefix)
+    parent, name = input_prefix.rsplit("/", 1)
+    return "{0}/{1}_MERGED/{2}".format(
+        parent, name, _safe_identifier(Path(current_file).stem)
     )
 
 
@@ -644,10 +663,13 @@ def _merge_orange_to_current_file(previous_s3, current_public_s3,
                                   request_id, work_dir, log):
     """Keep the Orange ESP-aware source while publishing the requested FINAL."""
     merged_public_s3 = _merged_s3_path(current_public_s3, current_file)
-    # Mailing uses its two-column FINAL as the current private source. A
-    # different subfolder is essential even when the two input paths match.
-    merged_private_s3 = "{0}/MERGED_PRIVATE/{1}".format(
-        _s3_prefix(current_private_s3), _safe_identifier(Path(current_file).stem)
+    # Mailing uses its FINAL path for both public and private inputs. Keep
+    # both merge exports as siblings of that stage so no export is later
+    # reloaded as though it were a current input file.
+    private_input = _s3_prefix(current_private_s3)
+    private_parent, private_name = private_input.rsplit("/", 1)
+    merged_private_s3 = "{0}/{1}_MERGED_PRIVATE/{2}".format(
+        private_parent, private_name, _safe_identifier(Path(current_file).stem)
     )
     _snowflake_merge(
         previous_s3, current_private_s3, merged_private_s3, "ORANGE",

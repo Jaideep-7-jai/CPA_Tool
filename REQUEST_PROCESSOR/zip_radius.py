@@ -68,8 +68,13 @@ def _redact(message, key, secret):
     )
 
 
-def _run_snow_sql(connection, query, log, key, secret, *, passphrase=""):
-    """Send SQL from a private temporary file, keeping keys out of argv/logs."""
+def _run_snow_sql(connection, query, log, key, secret, *, passphrase=None):
+    """Send SQL from a private file with credentials scoped to this connection.
+
+    The request processor may have set the datateam private-key passphrase in
+    its own environment.  Passing no passphrase here must clear that value for
+    the separate radius account, rather than silently using the wrong key.
+    """
     descriptor, query_path = tempfile.mkstemp(prefix="cpa_zip_radius_", suffix=".sql")
     try:
         with os.fdopen(descriptor, "w") as query_file:
@@ -84,6 +89,8 @@ def _run_snow_sql(connection, query, log, key, secret, *, passphrase=""):
         environment = os.environ.copy()
         if passphrase:
             environment["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = passphrase
+        else:
+            environment.pop("SNOWSQL_PRIVATE_KEY_PASSPHRASE", None)
         log.debug("ZIP radius SnowSQL query on %s: %s", connection,
                   _redact(query, key, secret))
         try:
@@ -158,9 +165,13 @@ def expand_zip_radius(source_s3_path, destination_table, radius_miles,
     credentials = "CREDENTIALS=(AWS_KEY_ID='{0}' AWS_SECRET_KEY='{1}')".format(
         key, secret,
     )
-    source_passphrase = (os.getenv("CPA_ZIP_RADIUS_SNOWSQL_PASSPHRASE")
-                         or getattr(config, "SNOWSQL_PASSPHRASE", ""))
-    target_passphrase = getattr(config, "SNOWSQL_PASSPHRASE", "")
+    # These SnowSQL connections use different users and private keys.  The
+    # radius connection is known to work with its normal SnowSQL settings when
+    # no dedicated passphrase is supplied.  Never fall back to the datateam
+    # passphrase (which the request processor may also have put in os.environ).
+    source_passphrase = os.getenv("CPA_ZIP_RADIUS_SNOWSQL_PASSPHRASE")
+    target_passphrase = (getattr(config, "SNOWSQL_PASSPHRASE", "")
+                         or os.getenv("SNOWSQL_PRIVATE_KEY_PASSPHRASE", ""))
 
     def execute(connection, query):
         passphrase = (source_passphrase if connection == source_connection

@@ -996,9 +996,8 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
             conn.close()
 
         # ── 3. Aggregate per-channel output metadata ───────────────────
-        # A Gender request can create Male and Female delivery files for one
-        # channel.  Aggregate them before updating the one-row-per-channel
-        # columns so the UI count remains the complete final count.
+        # A channel may have multiple delivery artifacts. Aggregate them
+        # before updating the one-row-per-channel fields in the requests table.
         channel_details = {}
         for fd in file_details:
             ch = (fd.get("channel") or "").upper().strip()
@@ -1322,26 +1321,26 @@ def submit_request():
         # so it cannot be routed into the non-DoorDash criteria processor.
         criteria_items = []
     if criteria_items:
-        allowed_criteria = {'age', 'state', 'zips'}
+        allowed_criteria = {'age', 'state', 'zips', 'gender'}
         if any(not isinstance(item, dict) for item in criteria_items):
             return jsonify({'ok': False, 'error': 'Criteria definition is invalid.'}), 400
         criteria_types = [item.get('type') for item in criteria_items]
-        if len(criteria_items) > 3 or len(set(criteria_types)) != len(criteria_types):
+        if len(criteria_items) > 4 or len(set(criteria_types)) != len(criteria_types):
             return jsonify({
                 'ok': False,
-                'error': 'Use each criterion only once: Age, State, and ZIP (maximum three).'
+                'error': 'Use each criterion only once: Age, State, ZIP, and Gender (maximum four).'
             }), 400
         invalid_criteria = [item for item in criteria_items if item.get('type') not in allowed_criteria]
         if invalid_criteria:
-            return jsonify({'ok': False, 'error': 'Criteria can use only Age, State, or ZIP.'}), 400
+            return jsonify({'ok': False, 'error': 'Criteria can use only Age, State, ZIP, or Gender.'}), 400
         if len(criteria_items) == 1:
             criteria_type = criteria_items[0].get('type', '')
             comp_type = criteria_items[0].get('comparison', '')
         else:
             criteria_type = 'multi'
             comp_type = 'include'
-    if criteria_type not in {'age', 'state', 'zips', 'multi'}:
-        return jsonify({'ok': False, 'error': 'Criteria type must be age, state, or ZIP.'}), 400
+    if criteria_type not in {'age', 'state', 'zips', 'gender', 'multi'}:
+        return jsonify({'ok': False, 'error': 'Criteria type must be age, state, ZIP, or gender.'}), 400
 
     if zip_radius_enabled:
         zip_selected = request_type == 'Doordash' or criteria_type == 'zips' or any(
@@ -1365,6 +1364,8 @@ def submit_request():
         return jsonify({'ok': False, 'error': 'Age criteria requires comp type greater or less.'}), 400
     if criteria_type in {'state', 'zips'} and comp_type not in {'include', 'exclude'}:
         return jsonify({'ok': False, 'error': 'State and ZIP criteria require Include or Exclude.'}), 400
+    if criteria_type == 'gender' and comp_type != 'include':
+        return jsonify({'ok': False, 'error': 'Gender requires Include and exactly one of Male or Female.'}), 400
 
     # Validate each channel
     valid_channels = {'ALL', 'GREEN', 'BLUE', 'ORANGE', 'ARCAMAX', 'APPTNESS'}
@@ -1392,6 +1393,14 @@ def submit_request():
             elif item_type == 'state':
                 if item.get('comparison') not in {'include', 'exclude'} or not item.get('values'):
                     return jsonify({'ok': False, 'error': 'State requires Include/Exclude and at least one value.'}), 400
+            elif item_type == 'gender':
+                gender_values = item.get('values')
+                if (comparison != 'include' or not isinstance(gender_values, list)
+                        or len(gender_values) != 1
+                        or not isinstance(gender_values[0], str)
+                        or gender_values[0].strip().upper() not in {'MALE', 'FEMALE'}):
+                    return jsonify({'ok': False, 'error': 'Select exactly one Gender: Male or Female.'}), 400
+                item['values'] = [gender_values[0].strip().upper()]
             elif item_type == 'zips' and item.get('comparison') not in {'include', 'exclude'}:
                 return jsonify({'ok': False, 'error': 'ZIP requires Include or Exclude.'}), 400
         if len(criteria_items) == 1:
@@ -1403,7 +1412,7 @@ def submit_request():
                     '{0},{1}'.format(item['from'], item['to'])
                     if comp_type == 'between' else str(item['value'])
                 )
-            elif criteria_type == 'state':
+            elif criteria_type in {'state', 'gender'}:
                 criteria_value = ','.join(item['values'])
             else:
                 criteria_value = None
@@ -1417,6 +1426,10 @@ def submit_request():
         if not values:
             return jsonify({'ok': False, 'error': 'At least one state value is required.'}), 400
         criteria_value = ','.join(s.upper() for s in values)
+    elif criteria_type == 'gender':
+        if criteria_value.strip().upper() not in {'MALE', 'FEMALE'}:
+            return jsonify({'ok': False, 'error': 'Select exactly one Gender: Male or Female.'}), 400
+        criteria_value = criteria_value.strip().upper()
     else:
         criteria_value = None
 
