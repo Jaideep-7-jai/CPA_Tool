@@ -632,8 +632,16 @@ def _write_error_marker(run_dir, subject, reason):
 
 
 def _output_detail_rows(file_details, include_private_paths):
-    """Build role-appropriate output rows for email bodies."""
-    rows = []
+    """Build labeled details per output file for text and HTML notifications."""
+    def display_count(value):
+        if value in (None, ""):
+            return "-"
+        try:
+            return "{:,}".format(int(value))
+        except (TypeError, ValueError):
+            return str(value)
+
+    output_files = []
     for detail in file_details:
         merge_note = detail.get("merge_mode") or "CURRENT_ONLY"
         if detail.get("merge_source_request_id"):
@@ -642,60 +650,58 @@ def _output_detail_rows(file_details, include_private_paths):
                 detail["merge_source_request_id"],
                 " ({0})".format(source_name) if source_name else "",
             )
-        if not include_private_paths:
-            rows.append([
-                detail.get("channel") or "-",
-                detail.get("filename") or "-",
-                detail.get("delivery_header") or "-",
-                detail.get("file_count") or 0,
-                detail.get("ftp_path") or "-",
-                merge_note,
+        fields = [
+            ("File name", detail.get("filename") or "-"),
+            ("Delivery header", detail.get("delivery_header") or "-"),
+            ("Delivered rows", display_count(detail.get("file_count"))),
+            ("FTP path", detail.get("ftp_path") or "-"),
+        ]
+        if include_private_paths:
+            fields.extend([
+                ("Local output", detail.get("path") or detail.get("local_output_dir") or "-"),
+                ("Final Data S3 path", detail.get("final_s3_path") or "-"),
+                ("Final Data header", detail.get("final_data_header") or "-"),
+                ("Final Data rows", display_count(detail.get("final_count"))),
+                ("Complete Data S3 path", detail.get("complete_s3_path") or "-"),
+                ("Complete Data header", detail.get("complete_data_header") or "-"),
+                ("Complete Data rows", display_count(detail.get("complete_count"))),
             ])
-            continue
-        rows.append([
-            detail.get("channel") or "-",
-            detail.get("filename") or "-",
-            detail.get("delivery_header") or "-",
-            detail.get("file_count") or 0,
-            detail.get("ftp_path") or "-",
-            detail.get("path") or detail.get("local_output_dir") or "-",
-            "{0} | header: {1} | count: {2}".format(
-                detail.get("final_s3_path") or "-",
-                detail.get("final_data_header") or "-",
-                detail.get("final_count") if detail.get("final_count") not in (None, "") else "-",
-            ),
-            "{0} | header: {1} | count: {2}".format(
-                detail.get("complete_s3_path") or "-",
-                detail.get("complete_data_header") or "-",
-                detail.get("complete_count") if detail.get("complete_count") not in (None, "") else "-",
-            ),
-            merge_note,
-        ])
-    return rows
+        fields.append(("Merge", merge_note))
+        output_files.append((detail.get("channel") or "-", fields))
+    return output_files
 
 
 def _output_details_html(file_details, include_private_paths):
-    rows = _output_detail_rows(file_details, include_private_paths)
-    if not rows:
+    output_files = _output_detail_rows(file_details, include_private_paths)
+    if not output_files:
         return "<p>No delivery file was generated because no matching data was returned.</p>"
-    if include_private_paths:
-        headers = [
-            "Channel", "File", "Delivery Header", "Final Count", "FTP Path",
-            "Local Output", "Final Data (S3)", "Complete Data (S3)", "Merge",
-        ]
-    else:
-        headers = ["Channel", "File", "Header", "Final Count", "FTP Path", "Merge"]
-    return _html_table(headers, rows)
+    sections = []
+    for channel, fields in output_files:
+        lines = "".join(
+            '<p style="margin:0 0 6px;font-size:14px;line-height:1.5;">'
+            '<strong>{0}:</strong> <span style="overflow-wrap:anywhere;word-wrap:break-word;word-break:break-all;">{1}</span></p>'.format(
+                html.escape(label), html.escape(str(value))
+            )
+            for label, value in fields
+        )
+        sections.append(
+            '<div style="margin:0 0 22px;max-width:800px;">'
+            '<h4 style="margin:12px 0 8px;font-size:16px;">{0}</h4>{1}</div>'.format(
+                html.escape(str(channel)), lines
+            )
+        )
+    return "".join(sections)
 
 
 def _output_details_text(file_details, include_private_paths):
-    rows = _output_detail_rows(file_details, include_private_paths)
-    if not rows:
+    output_files = _output_detail_rows(file_details, include_private_paths)
+    if not output_files:
         return "No delivery file was generated because no matching data was returned."
-    lines = []
-    for row in rows:
-        lines.append(" | ".join(str(value) for value in row))
-    return "\n".join(lines)
+    return "\n\n".join(
+        "{0}\n{1}".format(channel, "\n".join(
+            "{0}: {1}".format(label, value) for label, value in fields
+        )) for channel, fields in output_files
+    )
 
 
 def send_success_email(request_details, results, run_dir):
