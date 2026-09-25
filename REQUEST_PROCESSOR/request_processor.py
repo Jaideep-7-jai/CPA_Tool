@@ -597,7 +597,7 @@ def _responder_join(channel_name, responder_match, responder_days):
         )
     return (
         "JOIN (SELECT DISTINCT LOWER(TRIM(email)) AS email "
-        "FROM GREEN.DT_DATA.APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND "
+        "FROM GREEN.DT_DATA.APT_CUSTOM_L120_ORANGE_UNIQ_RESPONDERS_UNIQ_DND "
         "WHERE OPEN_DATE >= DATEADD(day, -{0}, CURRENT_DATE())) responders "
         "ON LOWER(TRIM(a.email_address)) = responders.email ".format(days)
     )
@@ -674,7 +674,7 @@ def _insert_into_perm_table(
             f"    WHERE {condition} GROUP BY 1"
             f"  ) b ON a.email_address = b.email_address AND a.created_at = b.maxdate"
             f") a "
-            f"JOIN APT_ADHOC_JAIDEEP_ZIP_ESP_DETAILS_INCLUDE_ORANGE_20260604 b "
+            f"JOIN (select distinct a.ACCOUNT_NAME,b.FEEDID from APT_ADHOC_ESP_ACCOUNTS_DND a,APT_ADHOC_ESP_DATA_EXPORTS_DND b where a.ESP_ACCOUNT_ID=b.ESP_ACCOUNT_ID) b "
             f"  ON a.FEED_ID = b.FEEDID "
             f"JOIN APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND c "
             f"  ON a.email_address = c.email_address "
