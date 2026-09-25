@@ -2057,7 +2057,7 @@ def _create_criteria_channel_table(perm_table, channel, criteria,
             "CREATE OR REPLACE TABLE {perm} AS "
             "SELECT a.email_address, esp.ACCOUNT_NAME AS account_name{selected_columns} "
             "FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a "
-            "JOIN APT_ADHOC_JAIDEEP_ZIP_ESP_DETAILS_INCLUDE_ORANGE_20260604 esp "
+            "JOIN (select distinct a.ACCOUNT_NAME,b.FEEDID from APT_ADHOC_ESP_ACCOUNTS_DND a , APT_ADHOC_ESP_DATA_EXPORTS_DND b where a.ESP_ACCOUNT_ID=b.ESP_ACCOUNT_ID) esp"
             "ON a.FEED_ID=esp.FEEDID "
             "JOIN APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND p "
             "ON a.email_address=p.email_address "
