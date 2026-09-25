@@ -29,8 +29,6 @@ import config as _app_config
 # been updated with the newer names.
 DB_CONFIG = _app_config.DB_CONFIG
 SENDER = _app_config.SENDER
-RECIPIENT = getattr(_app_config, "RECIPIENT", "")
-CC_RECIPIENTS = getattr(_app_config, "CC_RECIPIENTS", "")
 LEGACY_TECH_RECIPIENTS = getattr(_app_config, "TECH_NOTIFICATION_RECIPIENTS", ())
 LEGACY_CPA_RECIPIENTS = getattr(_app_config, "CPAUSER_EMAIL", ())
 
