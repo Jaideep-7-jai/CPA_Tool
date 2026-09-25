@@ -74,11 +74,18 @@ connection with SELECT access to
 working schema. ZIP lists are loaded to that connection, expanded and
 unloaded to S3, then loaded into the normal `datateam1` ZIP staging table.
 The source ZIPs are retained even when no zero-mile distance row exists.
-The radius connection uses its own SnowSQL credentials. If its private key
-requires a passphrase, set `CPA_ZIP_RADIUS_SNOWSQL_PASSPHRASE` to that key's
-passphrase. If `snowsql -c snowflake` works without one, leave this variable
-unset; the processor clears the inherited `datateam1` passphrase for radius
-queries. Keep the normal `SNOWSQL_PASSPHRASE` for `datateam1` queries.
+The `snowflake` connection is `zx_dataops_service` in `HUBUSERS.ZX_DATAOPS`.
+Export its key's `SNOWSQL_PRIVATE_KEY_PASSPHRASE` **before starting Flask**;
+the background worker captures that value before the main processor changes
+the process environment for `datateam1`. A dedicated
+`CPA_ZIP_RADIUS_SNOWSQL_PASSPHRASE` can override the source key. Keep
+`config.SNOWSQL_PASSPHRASE` configured separately for `datateam1`
+(`DATATEAM_DP_SERVICE`), as it is used by all channel queries. The radius
+query switches to `ADHOC_L_WH` (override with
+`CPA_ZIP_RADIUS_SOURCE_WAREHOUSE`), then exports results to the shared S3
+prefix. Source ZIP files can be headerless; the loader does not skip their
+first ZIP. Each SnowSQL operation has a 300-second default timeout
+(`CPA_ZIP_RADIUS_SQL_TIMEOUT_SECONDS`) and cannot wait for interactive input.
 
 ## Runtime configuration
 
@@ -94,6 +101,8 @@ export CPA_DB_NAME='CUST_TECH_DB'
 export CPA_FTP_USERNAME='…'
 export CPA_FTP_PASSWORD='…'
 export CPA_FTP_HOST='…'
+# Private-key passphrase for the snowflake (zx_dataops_service) connection:
+export SNOWSQL_PRIVATE_KEY_PASSPHRASE='…'
 export CPA_EMAIL_TECH_RECIPIENTS='…'
 export CPA_EMAIL_DATATEAM_RECIPIENTS='…'
 export CPA_EMAIL_CPA_RECIPIENTS='…'

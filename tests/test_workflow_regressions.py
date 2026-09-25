@@ -4,6 +4,7 @@ import gzip
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -72,7 +73,7 @@ class WorkflowRegressions(unittest.TestCase):
         environments = []
 
         def fake_run(command, **kwargs):
-            environments.append((command, kwargs["env"]))
+            environments.append((command, kwargs["env"], kwargs["stdin"]))
             return types.SimpleNamespace(returncode=0, stdout="1\n", stderr="")
 
         with patch.dict(os.environ, {"SNOWSQL_PRIVATE_KEY_PASSPHRASE": "datateam-key"}):
@@ -85,6 +86,64 @@ class WorkflowRegressions(unittest.TestCase):
         self.assertNotIn("SNOWSQL_PRIVATE_KEY_PASSPHRASE", environments[0][1])
         self.assertEqual(environments[1][1]["SNOWSQL_PRIVATE_KEY_PASSPHRASE"],
                          "datateam-key")
+        self.assertEqual(environments[0][2], subprocess.DEVNULL)
+
+    def test_zip_radius_loads_hubusers_then_datateam_with_separate_keys(self):
+        executed = []
+        destination_counts = iter((0, 38601))
+
+        def fake_snow_sql(connection, query, log, key, secret, *, passphrase=None):
+            executed.append((connection, query, passphrase))
+            if query.startswith("SELECT COUNT(*)"):
+                if connection == "datateam1":
+                    return "{0}\n".format(next(destination_counts))
+                return "23040\n"
+            return ""
+
+        environment = {
+            "SNOWSQL_PRIVATE_KEY_PASSPHRASE": "datateam-key",
+            "CPA_ZIP_RADIUS_AWS_KEY_ID": "test-key",
+            "CPA_ZIP_RADIUS_AWS_SECRET_KEY": "test-secret",
+            "CPA_ZIP_RADIUS_SOURCE_WAREHOUSE": "ADHOC_L_WH",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            with patch.object(zip_radius, "_SOURCE_PASSPHRASE_AT_STARTUP", "source-key"):
+                with patch.object(zip_radius.config, "SNOWSQL_PASSPHRASE", "datateam-key"):
+                    with patch.object(zip_radius, "_run_snow_sql", side_effect=fake_snow_sql):
+                        result = zip_radius.expand_zip_radius(
+                            "s3://bucket/uploads/zip.csv", "DEST_ZIPS", 30, 179, LOG,
+                            s3_base="s3://bucket/shared",
+                        )
+        self.assertEqual(result["source_count"], 23040)
+        self.assertEqual(result["expanded_count"], 38601)
+        source_queries = [query for connection, query, _ in executed
+                          if connection == "snowflake"]
+        dest_queries = [query for connection, query, _ in executed
+                        if connection == "datateam1"]
+        self.assertIn("CREATE TABLE", source_queries[0])
+        self.assertIn("SKIP_HEADER=0", source_queries[1])
+        self.assertIn("USE WAREHOUSE ADHOC_L_WH;", source_queries[3])
+        self.assertIn("ZX_UNIFIED_PROFILE.PUBLIC.D_ZIP_DISTANCE", source_queries[3])
+        self.assertIn("d.SOURCE_ZIP IN", source_queries[3])
+        self.assertIn("SKIP_HEADER=1", dest_queries[-2])
+        self.assertTrue(all(secret == "source-key" for connection, _, secret
+                            in executed if connection == "snowflake"))
+        self.assertTrue(all(secret == "datateam-key" for connection, _, secret
+                            in executed if connection == "datateam1"))
+
+    def test_zip_radius_snow_sql_timeout_is_bounded_and_noninteractive(self):
+        def timeout(command, **kwargs):
+            self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+            self.assertEqual(kwargs["timeout"], 10)
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        with patch.dict(os.environ, {"CPA_ZIP_RADIUS_SQL_TIMEOUT_SECONDS": "10"}):
+            with patch.object(zip_radius.subprocess, "run", side_effect=timeout):
+                with self.assertRaisesRegex(RuntimeError, "timed out after 10s"):
+                    zip_radius._run_snow_sql(
+                        "snowflake", "SELECT 1;", LOG, "test-key", "test-secret",
+                        passphrase="source-key",
+                    )
 
     def test_doordash_md5_header_and_zip_delivery(self):
         with tempfile.TemporaryDirectory() as tmp:
