@@ -575,10 +575,10 @@ def _drop_zip_staging_table(zip_staging_table: str, log) -> None:
 
 # ── Per-channel perm table helpers ───────────────────────────────────────────
 
-def _responder_join(channel_name, responder_match, responder_days):
+def _responder_join(channel_name, responder_match, responder_days, email_column=None):
     """Apply Orange's default L90 match, or the explicitly selected window."""
     channel_name = str(channel_name).upper()
-    if channel_name not in ("GREEN", "BLUE", "ORANGE"):
+    if channel_name not in ("GREEN", "BLUE", "ARCAMAX", "ORANGE"):
         return ""
     if not responder_match and channel_name != "ORANGE":
         return ""
@@ -596,6 +596,19 @@ def _responder_join(channel_name, responder_match, responder_days):
                 responder_channel, days
             )
         )
+    if channel_name == "ARCAMAX":
+        # Delivery logs contain text dates such as 08-08-2024 as well as
+        # native/ISO dates. A NULL or unparseable OPEN_DATE never matches.
+        open_date = (
+            "COALESCE(TRY_TO_DATE(TO_VARCHAR(OPEN_DATE), 'MM-DD-YYYY'), "
+            "TRY_TO_DATE(TO_VARCHAR(OPEN_DATE), 'YYYY-MM-DD'))"
+        )
+        return (
+            "JOIN (SELECT DISTINCT LOWER(TRIM(EMAIL)) AS email "
+            "FROM GREEN.DT_DATA.ARCAMAX_DELIVERY_LOGS "
+            "WHERE {0} >= DATEADD(day, -{1}, CURRENT_DATE())) responders "
+            "ON LOWER(TRIM(TO_VARCHAR({2}))) = responders.email "
+        ).format(open_date, days, email_column or "a.EMAIL")
     return (
         "JOIN (SELECT DISTINCT LOWER(TRIM(email)) AS email "
         "FROM GREEN.DT_DATA.APT_CUSTOM_L120_ORANGE_UNIQ_RESPONDERS_UNIQ_DND "
@@ -650,15 +663,20 @@ def _insert_into_perm_table(
         )
 
     elif channel_name == "ARCAMAX":
-        condition = (
-            f"ZIP {kw} (SELECT zip_code FROM {zip_staging_table})"
-        )
+        profile = _arcamax_profile_columns(log, {"zips"})
+        condition = "a.{0} {1} (SELECT zip_code FROM {2})".format(
+            profile["zips"], kw, zip_staging_table)
+        responder_join = _responder_join(
+            channel_name, responder_match, responder_days,
+            "a.{0}".format(profile["email"]))
         insert_sql = (
-            f"CREATE OR REPLACE TABLE {perm_table} AS "
-            f"SELECT email, ZIP "
-            f"FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
-            f"WHERE {condition};"
-        )
+            "CREATE OR REPLACE TABLE {perm} AS "
+            "SELECT a.{email} AS email, a.{zip} AS ZIP "
+            "FROM {profile} a "
+            "{join}WHERE {condition};"
+        ).format(perm=perm_table, email=profile["email"], zip=profile["zips"],
+                 profile=_ARCAMAX_PROFILE_TABLE, join=responder_join,
+                 condition=condition)
 
     else:  # ORANGE
         condition = (
@@ -951,319 +969,6 @@ def _success_result(channel_name, output_file, final_file_path, elapsed, record_
 # Channel processors  (7-step flow — mirrors age_state channel processors)
 # ---------------------------------------------------------------------------
 
-def process_green_blue_zip(request_id, channel_name, zip_staging_table, run_dir: Path):
-    """
-    GREEN and BLUE channel processor for ZIPS.
-    Same 7-step flow as age_state.process_green_blue.
-    Receives the shared zip_staging_table name; does NOT create or drop it.
-    After FTP upload the FTP path is saved to requests.<CHANNEL>_FTP.
-    """
-    TOTAL_STEPS    = 7
-    channel_name   = channel_name.upper()
-    channel_status = f"{channel_name}_STATUS"
-    log            = setup_channel_logging(run_dir, channel_name)
-
-    log.info("=" * 70)
-    log.info(f"  {channel_name} CHANNEL (ZIPS) PROCESSING STARTED")
-    log.info(f"  request_id       : {request_id}")
-    log.info(f"  zip_staging_table: {zip_staging_table}")
-    log.info(f"  run_dir          : {run_dir}")
-    log.info("=" * 70)
-    update_request_status(request_id, "Started", channel_status, log)
-
-    ctx = _build_common_context(request_id, channel_name, run_dir)
-    _trace(
-        log, "channel input validation", request_id=request_id,
-        channel=channel_name, request_type=ctx["request_type"],
-        comparison=ctx["comp_type"], target_table=ctx["perm_table"],
-        staging_table=zip_staging_table,
-        responder_match=bool(ctx["request_data"].get("responder_match")),
-        responder_days=(ctx["request_data"].get("responder_days")
-                        if ctx["request_data"].get("responder_match") else "not enabled"),
-        merge_source_request_id=(ctx["request_data"].get("merge_source_request_id") or "NULL"),
-    )
-    log.info(
-        f"  comp_type      = {ctx['comp_type']}\n"
-        f"  perm_table     = {ctx['perm_table']}\n"
-        f"  path_FINAL     = {ctx['path_FINAL']}\n"
-        f"  path_COMPLETE  = {ctx['path_COMPLETE']}\n"
-        f"  output_file    = {ctx['output_file']}"
-    )
-
-    try:
-        channel_tmp     = ctx["channel_tmp"]
-        final_files_dir = ctx["final_files_dir"]
-        perm_table      = ctx["perm_table"]
-        path_FINAL      = ctx["path_FINAL"]
-        path_COMPLETE   = ctx["path_COMPLETE"]
-        start_time      = time.time()
-
-        # ── STEP 1/7 ──────────────────────────────────────────────────────
-        _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting ZIP-matched data", channel_name)
-        update_request_status(request_id, "Loading to Snowflake", channel_status, log)
-        inserted_count = _insert_into_perm_table(
-            perm_table, channel_name, zip_staging_table, ctx["comp_type"],
-            ctx["request_data"].get("responder_match"),
-            ctx["request_data"].get("responder_days"), log
-        )
-
-        if inserted_count == 0:
-            update_request_status(request_id, "No Data Retrieved", channel_status, log)
-            log.warning(
-                f"  NO DATA RETRIEVED: 0 rows inserted into {perm_table}. "
-                f"Skipping remaining steps for {channel_name}."
-            )
-            _drop_perm_table(perm_table, log)
-            return {
-                "channel": channel_name, "file": None, "final_file_path": None,
-                "status": "NO_DATA", "elapsed": time.time() - start_time, "count": 0,
-            }
-
-        log.info(f"  STEP 1 DONE: Data loaded into {perm_table}")
-
-        # ── STEP 2/7 ──────────────────────────────────────────────────────
-        _step(log, 2, TOTAL_STEPS, "Exporting FINAL FILE (DISTINCT emails) to S3", channel_name)
-        update_request_status(request_id, "Exporting Final File", channel_status, log)
-        _export_complete_final_file("FINAL", perm_table, path_FINAL, channel_name, log)
-        log.info(f"  STEP 2 DONE: FINAL FILE exported -> {path_FINAL}")
-
-        # ── STEP 3/7 ──────────────────────────────────────────────────────
-        _step(log, 3, TOTAL_STEPS, "Exporting COMPLETE DATA FILE (email + ZIP) to S3", channel_name)
-        update_request_status(request_id, "Exporting Complete File", channel_status, log)
-        _export_complete_final_file("COMPLETE", perm_table, path_COMPLETE, channel_name, log)
-        log.info(f"  STEP 3 DONE: COMPLETE FILE exported -> {path_COMPLETE}")
-
-        # ── STEP 4/7 ──────────────────────────────────────────────────────
-        _step(log, 4, TOTAL_STEPS, f"Dropping permanent Snowflake table {perm_table}", channel_name)
-        _drop_perm_table(perm_table, log)
-        log.info(f"  STEP 4 DONE: Table {perm_table} dropped")
-
-        # ── STEP 5/7 ──────────────────────────────────────────────────────
-        _step(log, 5, TOTAL_STEPS, "Downloading FINAL FILE parts from S3 + combining", channel_name)
-        update_request_status(request_id, "Combining Data", channel_status, log)
-        download_dir   = channel_tmp / f"{channel_name}_FINAL_DL"
-        combined_count = _download_and_combine(
-            path_FINAL, download_dir, channel_tmp,
-            ctx["output_file"], channel_name, log
-        )
-        log.info(f"  STEP 5 DONE: Combined file rows: {combined_count:,}")
-
-        # ── STEP 6/7 ──────────────────────────────────────────────────────
-        _step(log, 6, TOTAL_STEPS, "Moving combined file to FINAL_FILES/", channel_name)
-        src_file  = channel_tmp / ctx["output_file"]
-        dest_file = final_files_dir / ctx["output_file"]
-        _verify_local_file(log, "combined channel file before move", src_file)
-        shutil.move(str(src_file), str(dest_file))
-        _verify_local_file(log, "final channel file after move", dest_file)
-        record_count = _count_file_lines(str(dest_file))
-        _trace(log, "channel storage update", channel=channel_name,
-               s3_path=path_FINAL, row_count=record_count)
-        update_channel_storage(request_id, channel_name, path_FINAL, record_count, log)
-        merge_mode = ""
-        if ctx["request_data"].get("merge_source_request_id"):
-            _trace(log, "merge enabled", current_request_id=request_id,
-                   source_request_id=ctx["request_data"]["merge_source_request_id"],
-                   channel=channel_name)
-            merge_result = merge_current_file(
-                request_id, ctx["request_data"]["merge_source_request_id"], channel_name,
-                dest_file, path_FINAL, channel_tmp, log
-            )
-            record_count, merge_mode = merge_result["count"], merge_result["merge_mode"]
-            _verify_local_file(log, "merged channel file", dest_file)
-            _trace(log, "merge completed", channel=channel_name,
-                   merge_mode=merge_mode, merged_row_count=record_count,
-                   merged_s3_path=merge_result.get("s3_path", ""))
-        else:
-            _trace(log, "merge skipped", channel=channel_name,
-                   reason="merge_source_request_id is NULL")
-        log.info(f"  STEP 6 DONE: Moved {src_file.name} -> FINAL_FILES/  |  rows: {record_count:,}")
-
-        # ── STEP 7/7 ──────────────────────────────────────────────────────
-        _step(log, 7, TOTAL_STEPS, f"FTP upload -> /CPA/{ctx['path_date']}/{ctx['output_file']}", channel_name)
-        update_request_status(request_id, "Posting To FTP", channel_status, log)
-        ftp_path = _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
-        update_ftp_path(request_id, channel_name, ftp_path, log, record_count)
-        log.info(f"  STEP 7 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path}")
-
-        elapsed = time.time() - start_time
-        update_request_status(request_id, "Completed", channel_status, log)
-
-        log.info("=" * 70)
-        log.info(f"  {channel_name} CHANNEL (ZIPS) PROCESSING COMPLETED SUCCESSFULLY")
-        log.info(f"  Total elapsed   : {elapsed:.2f}s")
-        log.info(f"  Final file      : FINAL_FILES/{ctx['output_file']}")
-        log.info(f"  Final row count : {record_count:,}")
-        log.info(f"  FTP path        : {ftp_path}")
-        log.info("=" * 70)
-
-        _cleanup_channel_tmp(channel_tmp, log)
-        result = _success_result(
-            channel_name, ctx["output_file"], str(dest_file), elapsed, record_count
-        )
-        result["merge_mode"] = merge_mode
-        return result
-
-    except Exception:
-        update_request_status(request_id, "Failed", channel_status, log)
-        log.exception(f"  {channel_name} CHANNEL (ZIPS) FAILED")
-        raise
-
-
-def process_arcamax_zip(request_id, zip_staging_table, run_dir: Path):
-    """
-    ARCAMAX channel processor for ZIPS.
-    Same 7-step flow as age_state.process_arcamax.
-    Uses the shared zip_staging_table for ZIP matching in Snowflake.
-    After FTP upload the FTP path is saved to requests.ARCAMAX_FTP.
-    """
-    TOTAL_STEPS    = 7
-    channel_name   = "ARCAMAX"
-    channel_status = "ARCAMAX_STATUS"
-    log            = setup_channel_logging(run_dir, channel_name)
-
-    log.info("=" * 70)
-    log.info(f"  ARCAMAX CHANNEL (ZIPS) PROCESSING STARTED")
-    log.info(f"  request_id       : {request_id}")
-    log.info(f"  zip_staging_table: {zip_staging_table}")
-    log.info(f"  run_dir          : {run_dir}")
-    log.info("=" * 70)
-    update_request_status(request_id, "Started", channel_status, log)
-
-    ctx = _build_common_context(request_id, channel_name, run_dir)
-    _trace(
-        log, "channel input validation", request_id=request_id,
-        channel=channel_name, request_type=ctx["request_type"],
-        comparison=ctx["comp_type"], target_table=ctx["perm_table"],
-        staging_table=zip_staging_table,
-        responder_match=bool(ctx["request_data"].get("responder_match")),
-        responder_days=(ctx["request_data"].get("responder_days")
-                        if ctx["request_data"].get("responder_match") else "not enabled"),
-        merge_source_request_id=(ctx["request_data"].get("merge_source_request_id") or "NULL"),
-    )
-    log.info(
-        f"  comp_type     = {ctx['comp_type']}\n"
-        f"  perm_table    = {ctx['perm_table']}\n"
-        f"  path_FINAL    = {ctx['path_FINAL']}\n"
-        f"  path_COMPLETE = {ctx['path_COMPLETE']}\n"
-        f"  output_file   = {ctx['output_file']}"
-    )
-
-    try:
-        channel_tmp     = ctx["channel_tmp"]
-        final_files_dir = ctx["final_files_dir"]
-        perm_table      = ctx["perm_table"]
-        path_FINAL      = ctx["path_FINAL"]
-        path_COMPLETE   = ctx["path_COMPLETE"]
-        start_time      = time.time()
-
-        # ── STEP 1/7 ──────────────────────────────────────────────────────
-        _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting ZIP-matched data", channel_name)
-        update_request_status(request_id, "Loading to Snowflake", channel_status, log)
-        inserted_count = _insert_into_perm_table(
-            perm_table, channel_name, zip_staging_table, ctx["comp_type"],
-            ctx["request_data"].get("responder_match"),
-            ctx["request_data"].get("responder_days"), log
-        )
-
-        if inserted_count == 0:
-            update_request_status(request_id, "No Data Retrieved", channel_status, log)
-            log.warning(f"  NO DATA: 0 rows inserted. Skipping remaining steps.")
-            _drop_perm_table(perm_table, log)
-            return {
-                "channel": channel_name, "file": None, "final_file_path": None,
-                "status": "NO_DATA", "elapsed": time.time() - start_time, "count": 0,
-            }
-
-        log.info(f"  STEP 1 DONE: Data loaded into {perm_table}")
-
-        # ── STEP 2/7 ──────────────────────────────────────────────────────
-        _step(log, 2, TOTAL_STEPS, "Exporting FINAL FILE (DISTINCT emails) to S3", channel_name)
-        update_request_status(request_id, "Exporting Final File", channel_status, log)
-        _export_complete_final_file("FINAL", perm_table, path_FINAL, channel_name, log)
-        log.info(f"  STEP 2 DONE: FINAL FILE exported -> {path_FINAL}")
-
-        # ── STEP 3/7 ──────────────────────────────────────────────────────
-        _step(log, 3, TOTAL_STEPS, "Exporting COMPLETE DATA FILE (email + ZIP) to S3", channel_name)
-        update_request_status(request_id, "Exporting Complete File", channel_status, log)
-        _export_complete_final_file("COMPLETE", perm_table, path_COMPLETE, channel_name, log)
-        log.info(f"  STEP 3 DONE: COMPLETE FILE exported -> {path_COMPLETE}")
-
-        # ── STEP 4/7 ──────────────────────────────────────────────────────
-        _step(log, 4, TOTAL_STEPS, f"Dropping permanent Snowflake table {perm_table}", channel_name)
-        _drop_perm_table(perm_table, log)
-        log.info(f"  STEP 4 DONE: Table {perm_table} dropped")
-
-        # ── STEP 5/7 ──────────────────────────────────────────────────────
-        _step(log, 5, TOTAL_STEPS, "Downloading FINAL FILE parts from S3 + combining", channel_name)
-        update_request_status(request_id, "Combining Data", channel_status, log)
-        download_dir   = channel_tmp / "ARCAMAX_FINAL_DL"
-        combined_count = _download_and_combine(
-            path_FINAL, download_dir, channel_tmp,
-            ctx["output_file"], channel_name, log
-        )
-        log.info(f"  STEP 5 DONE: Combined file rows: {combined_count:,}")
-
-        # ── STEP 6/7 ──────────────────────────────────────────────────────
-        _step(log, 6, TOTAL_STEPS, "Moving combined file to FINAL_FILES/", channel_name)
-        src_file  = channel_tmp / ctx["output_file"]
-        dest_file = final_files_dir / ctx["output_file"]
-        _verify_local_file(log, "combined channel file before move", src_file)
-        shutil.move(str(src_file), str(dest_file))
-        _verify_local_file(log, "final channel file after move", dest_file)
-        record_count = _count_file_lines(str(dest_file))
-        _trace(log, "channel storage update", channel=channel_name,
-               s3_path=path_FINAL, row_count=record_count)
-        update_channel_storage(request_id, channel_name, path_FINAL, record_count, log)
-        merge_mode = ""
-        if ctx["request_data"].get("merge_source_request_id"):
-            _trace(log, "merge enabled", current_request_id=request_id,
-                   source_request_id=ctx["request_data"]["merge_source_request_id"],
-                   channel=channel_name)
-            merge_result = merge_current_file(
-                request_id, ctx["request_data"]["merge_source_request_id"], channel_name,
-                dest_file, path_FINAL, channel_tmp, log
-            )
-            record_count, merge_mode = merge_result["count"], merge_result["merge_mode"]
-            _verify_local_file(log, "merged channel file", dest_file)
-            _trace(log, "merge completed", channel=channel_name,
-                   merge_mode=merge_mode, merged_row_count=record_count,
-                   merged_s3_path=merge_result.get("s3_path", ""))
-        else:
-            _trace(log, "merge skipped", channel=channel_name,
-                   reason="merge_source_request_id is NULL")
-        log.info(f"  STEP 6 DONE: Moved {src_file.name} -> FINAL_FILES/  |  rows: {record_count:,}")
-
-        # ── STEP 7/7 ──────────────────────────────────────────────────────
-        _step(log, 7, TOTAL_STEPS, f"FTP upload -> /CPA/{ctx['path_date']}/{ctx['output_file']}", channel_name)
-        update_request_status(request_id, "Posting To FTP", channel_status, log)
-        ftp_path = _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
-        update_ftp_path(request_id, channel_name, ftp_path, log, record_count)
-        log.info(f"  STEP 7 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path}")
-
-        elapsed = time.time() - start_time
-        update_request_status(request_id, "Completed", channel_status, log)
-
-        log.info("=" * 70)
-        log.info(f"  ARCAMAX CHANNEL (ZIPS) PROCESSING COMPLETED SUCCESSFULLY")
-        log.info(f"  Total elapsed   : {elapsed:.2f}s")
-        log.info(f"  Final file      : FINAL_FILES/{ctx['output_file']}")
-        log.info(f"  Final row count : {record_count:,}")
-        log.info(f"  FTP path        : {ftp_path}")
-        log.info("=" * 70)
-
-        _cleanup_channel_tmp(channel_tmp, log)
-        result = _success_result(
-            channel_name, ctx["output_file"], str(dest_file), elapsed, record_count
-        )
-        result["merge_mode"] = merge_mode
-        return result
-
-    except Exception:
-        update_request_status(request_id, "Failed", channel_status, log)
-        log.exception("  ARCAMAX CHANNEL (ZIPS) FAILED")
-        raise
-
-
 def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
     """
     ORANGE channel processor for ZIPS.
@@ -1430,217 +1135,6 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator  (mirrors process_age_state_request)
-# ---------------------------------------------------------------------------
-
-def process_zip_request(
-    request_id: int,
-    zip_file: str,
-    channel,
-    output_dir: str,
-):
-    """
-    Main entry point called by main.py.
-
-    request_id : DB request ID (used to fetch client_name, request_type, comp_type ...)
-    zip_file   : absolute path to the ZIP codes file uploaded via UI
-    channel    : list like ['ALL'] or ['GREEN', 'BLUE'] or single string 'ALL'
-    output_dir : base output directory
-
-    Flow
-    ----
-      PRE:   Upload ZIP file -> S3
-             CREATE shared ZIP staging table ONCE
-             COPY ZIP codes from S3 into staging table
-
-      PARALLEL: Run all requested channels concurrently (same as age_state)
-
-      POST:  DROP shared ZIP staging table (only after all channels finish)
-    """
-    # ── Run directory ─────────────────────────────────────────────────────
-    ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(output_dir) / f"run_zips_{ts}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    log = setup_main_logging(run_dir)
-
-    log.info("=" * 70)
-    log.info("  ZIP REQUEST STARTED")
-    log.info(f"  request_id : {request_id}")
-    log.info(f"  zip_file   : {zip_file}")
-    log.info(f"  channel    : {channel}")
-    log.info(f"  output_dir : {output_dir}")
-    log.info(f"  run_dir    : {run_dir}")
-    log.info("=" * 70)
-
-    # ── Resolve channels ──────────────────────────────────────────────────
-    if isinstance(channel, str):
-        channel = [channel]
-
-    if "ALL" in channel:
-        channels_to_run = list(CHANNELS)
-    else:
-        channels_to_run = [ch.upper() for ch in channel if ch.upper() in CHANNELS]
-
-    requested_channels = [str(ch).upper() for ch in channel]
-    invalid_channels = [ch for ch in requested_channels if ch != "ALL" and ch not in CHANNELS]
-    if invalid_channels:
-        raise ValueError(
-            "Unsupported ZIP channel(s): " + ", ".join(invalid_channels)
-        )
-    if not channels_to_run:
-        raise ValueError("At least one supported channel must be selected for a ZIP request.")
-
-    log.info(f"  Channels to run: {channels_to_run}")
-
-    # ── Fetch request details (for comp_type) ─────────────────────────────
-    request_data = fetch_request_details(request_id)
-    if not request_data:
-        raise Exception(f"Request ID {request_id} not found in DB")
-
-    comp_type = request_data["comp_type"]  # 'include' | 'exclude'
-    log.info(f"  comp_type: {comp_type}")
-    _verify_local_file(log, "uploaded ZIP input", zip_file)
-    _trace(
-        log, "request validation passed", request_type=request_data["request_type"],
-        comparison=comp_type, selected_channels=",".join(channels_to_run),
-        responder_match=bool(request_data.get("responder_match")),
-        responder_days=(request_data.get("responder_days")
-                        if request_data.get("responder_match") else "not enabled"),
-        merge_source_request_id=(request_data.get("merge_source_request_id") or "NULL"),
-        execution_mode=("single-channel" if len(channels_to_run) == 1 else "parallel"),
-    )
-
-    # ── PRE-CHANNEL STEP A: Upload ZIP file -> S3 ─────────────────────────
-    path_date   = datetime.now().strftime("%Y%m%d")
-    s3_zip_dir  = f"{S3_BASE}/ZIPS/{path_date}/staging"
-    s3_zip_path = f"{s3_zip_dir}/{os.path.basename(zip_file)}"
-
-    log.info(f"  [PRE] Uploading ZIP codes file to S3: {s3_zip_path}")
-    run_command(["aws", "s3", "cp", zip_file, s3_zip_path, "--quiet"])
-    log.info(f"  [PRE] ZIP file uploaded -> {s3_zip_path}")
-    _trace(log, "ZIP input upload completed", local_file=zip_file,
-           local_size_bytes=Path(zip_file).stat().st_size, s3_path=s3_zip_path)
-
-    # ── PRE-CHANNEL STEP B: Create shared ZIP staging table ONCE ─────────
-    zip_staging_table = f"APT_CPA_ZIPS_STAGING_{ts}"
-    log.info(f"  [PRE] Creating shared ZIP staging table: {zip_staging_table}")
-    _create_zip_staging_table(zip_staging_table, log)
-
-    # ── PRE-CHANNEL STEP C: Load ZIP codes into staging table ─────────────
-    log.info(f"  [PRE] Loading ZIP codes into staging table from S3 ...")
-    zip_count = _load_zips_from_s3(zip_staging_table, s3_zip_path, log)
-    log.info(f"  [PRE] {zip_count:,} ZIP codes loaded into {zip_staging_table}")
-
-    if zip_count == 0:
-        log.error("  [PRE] No ZIP codes loaded into staging table — aborting all channels")
-        _drop_zip_staging_table(zip_staging_table, log)
-        raise RuntimeError("ZIP staging table is empty — no ZIP codes were loaded from the file.")
-
-    # ── Channel processor map ──────────────────────────────────────────────
-    def _run_channel(ch):
-        _trace(log, "dispatching channel", channel=ch,
-               processor=("GREEN_BLUE" if ch in ("GREEN", "BLUE") else ch))
-        if ch in ("GREEN", "BLUE"):
-            return process_green_blue_zip(request_id, ch, zip_staging_table, run_dir)
-        elif ch == "ARCAMAX":
-            return process_arcamax_zip(request_id, zip_staging_table, run_dir)
-        elif ch == "ORANGE":
-            return process_orange_zip(request_id, zip_staging_table, run_dir)
-        else:
-            raise ValueError(f"Unknown channel: {ch}")
-
-    # ── Parallel channel execution (same pattern as age_state) ────────────
-    results = {}
-    errors  = []
-
-    if len(channels_to_run) == 1:
-        ch = channels_to_run[0]
-        log.info(f"  Single channel '{ch}' — running directly (no thread pool)")
-        try:
-            result = _run_channel(ch)
-            results[ch] = result
-            log.info(f"  Channel '{ch}' completed: {result.get('count', 0):,} records")
-        except Exception as exc:
-            log.error(f"  Channel '{ch}' FAILED: {exc}")
-            errors.append((ch, str(exc)))
-    else:
-        log.info(f"  Multiple channels — running in parallel with ThreadPoolExecutor")
-        with ThreadPoolExecutor(max_workers=len(channels_to_run)) as executor:
-            future_to_ch = {
-                executor.submit(_run_channel, ch): ch
-                for ch in channels_to_run
-            }
-            for future in as_completed(future_to_ch):
-                ch = future_to_ch[future]
-                try:
-                    result = future.result()
-                    results[ch] = result
-                    log.info(
-                        f"  Channel '{ch}' completed: "
-                        f"{result.get('count', 0):,} records"
-                    )
-                except Exception as exc:
-                    log.error(f"  Channel '{ch}' FAILED: {exc}")
-                    errors.append((ch, str(exc)))
-
-    # ── POST-CHANNEL: DROP shared ZIP staging table ───────────────────────
-    log.info(f"  [POST] All channels finished. Dropping shared ZIP staging table: {zip_staging_table}")
-    try:
-        _drop_zip_staging_table(zip_staging_table, log)
-    except Exception as exc:
-        log.warning(f"  [POST] Failed to drop ZIP staging table (non-fatal): {exc}")
-
-    # ── Summary ───────────────────────────────────────────────────────────
-    total_records = sum(
-        v.get("count", 0) for v in results.values() if isinstance(v, dict)
-    )
-    summary_lines = [
-        f"  {ch}: {v.get('file')} ({v.get('count', 0):,} records)"
-        for ch, v in results.items()
-        if isinstance(v, dict)
-    ]
-    summary = (
-        f"\n{'=' * 60}\n"
-        f"ZIP REQUEST COMPLETE\n"
-        f"request_id  : {request_id}\n"
-        f"comp_type   : {comp_type}\n"
-        f"Channels    : {', '.join(channels_to_run)}\n"
-        f"Total recs  : {total_records:,}\n"
-        f"ZIP staging : {zip_staging_table} (DROPPED)\n"
-        f"Output      : {run_dir}/FINAL_FILES\n"
-        + "\n".join(summary_lines)
-        + (
-            f"\nERRORS ({len(errors)}): " + "; ".join(f"{c}: {e}" for c, e in errors)
-            if errors
-            else ""
-        )
-        + f"\n{'=' * 60}"
-    )
-    log.info(summary)
-    _trace(log, "orchestrator result validation",
-           requested_channels=",".join(channels_to_run),
-           completed_channels=",".join(sorted(results.keys())) or "none",
-           failed_channels=",".join(ch for ch, _ in errors) or "none",
-           total_records=total_records)
-
-    if errors:
-        send_error_email(
-            request_data,
-            "\n".join(f"{c}: {e}" for c, e in errors),
-            run_dir,
-        )
-    else:
-        send_success_email(request_data, results, run_dir)
-
-    if errors:
-        raise RuntimeError(
-            "ZIP request failed for channel(s): "
-            + "; ".join(f"{channel}: {error}" for channel, error in errors)
-        )
-
-
-# ---------------------------------------------------------------------------
 # Output naming and FTP routing
 # ---------------------------------------------------------------------------
 
@@ -1676,10 +1170,9 @@ def _post_to_ftp(final_files_dir, path_date, output_file, log, request_type=None
 # Consolidated non-DoorDash criteria processor
 # =============================================================================
 #
-# The original ZIP-only functions above remain private compatibility helpers for
-# the DoorDash workflow.  All Suppression and Mailing requests now enter through
-# process_request() below, regardless of whether they contain one criterion or
-# a mixture of Age, State, and ZIP criteria.
+# DoorDash uses the shared process_orange_zip and ZIP helpers above. The
+# retired ZIP-only entry points are archived in old_module/zip_processor.py.
+# Suppression and Mailing requests enter through process_request() below.
 
 CONSOLIDATED_CRITERIA = ("age", "state", "zips", "gender")
 
@@ -1819,24 +1312,74 @@ def _criteria_from_request(request_data):
     return normalised
 
 
-def _column_map(channel):
+_ARCAMAX_PROFILE_TABLE = "GREEN.DT_DATA.APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE_DND_SF"
+
+
+def _arcamax_profile_columns(log, required):
+    """Verify the newer profile's column names before constructing SQL.
+
+    AGE can be a numeric AGE or a date BIRTHDAY/DOB. The confirmed gender
+    source is SEX, with GENDER accepted if the profile schema uses that name.
+    """
+    metadata_sql = (
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_CATALOG='GREEN' "
+        "AND TABLE_SCHEMA='DT_DATA' "
+        "AND TABLE_NAME='{0}' "
+        "AND COLUMN_NAME IN ('EMAIL','EMAILID','EMAIL_ADDRESS',"
+        "'AGE','BIRTHDAY','DOB','STATE','ZIP','ZIPCODE','ZIP_CODE',"
+        "'SEX','GENDER')"
+    ).format(_ARCAMAX_PROFILE_TABLE.rsplit(".", 1)[-1])
+    _trace(log, "Arcamax profile schema lookup", table=_ARCAMAX_PROFILE_TABLE,
+           required_criteria=",".join(sorted(required)), query=metadata_sql)
+    output = run_command([
+        "snowsql", "-c", "datateam1", "-q", metadata_sql,
+        "-o", "output_format=csv", "-o", "header=false",
+        "-o", "timing=false", "-o", "friendly=false", "-o", "exit_on_error=true",
+    ])
+    available = {line.strip().strip('"').upper() for line in output.splitlines()}
+    def choose(*names):
+        return next((name for name in names if name in available), None)
+    fields = {
+        "email": choose("EMAIL", "EMAILID", "EMAIL_ADDRESS"),
+        "age": choose("AGE", "BIRTHDAY", "DOB"),
+        "state": choose("STATE"),
+        "zips": choose("ZIP", "ZIPCODE", "ZIP_CODE"),
+        "gender": choose("SEX", "GENDER"),
+    }
+    missing = [field for field in ("email",) + tuple(sorted(required))
+               if not fields[field]]
+    if missing:
+        raise RuntimeError(
+            "Arcamax profile {0} is missing required column(s): {1}. "
+            "Check the Snowflake profile schema.".format(
+                _ARCAMAX_PROFILE_TABLE, ", ".join(missing)))
+    _trace(log, "Arcamax profile columns resolved", table=_ARCAMAX_PROFILE_TABLE,
+           **{field: fields[field] or "unused" for field in ("email",) + tuple(sorted(required))})
+    return fields
+
+
+def _column_map(channel, arcamax_columns=None):
     channel = str(channel).upper()
     if channel in ("GREEN", "BLUE"):
         # BLUE joins the same DND table as GREEN; its profile selects the email.
         return {"age": "b.AGE", "state": "b.STATE", "zips": "b.ZIP",
                 "gender": "b.GENDER"}
     if channel == "ARCAMAX":
-        return {"age": "a.birthday", "state": "a.STATE", "zips": "a.ZIP",
-                "gender": "g.gender"}
+        fields = arcamax_columns or {"age": "AGE", "state": "STATE",
+                                     "zips": "ZIP", "gender": "SEX"}
+        return {kind: "a.{0}".format(fields[kind])
+                for kind in ("age", "state", "zips", "gender")
+                if fields.get(kind)}
     if channel == "ORANGE":
         return {"age": "a.dob", "state": "a.STATE", "zips": "a.ZIP",
                 "gender": "a.GENDER"}
     raise ValueError("Unsupported channel: {0}".format(channel))
 
 
-def _gender_expression(channel):
+def _gender_expression(channel, arcamax_columns=None):
     """Normalize M/F and Male/Female source values to one audit value."""
-    column = _column_map(channel)["gender"]
+    column = _column_map(channel, arcamax_columns)["gender"]
     return (
         "CASE UPPER(TRIM(TO_VARCHAR({0}))) "
         "WHEN 'M' THEN 'MALE' WHEN 'MALE' THEN 'MALE' "
@@ -1845,58 +1388,11 @@ def _gender_expression(channel):
     ).format(column)
 
 
-def _arcamax_gender_join(log):
-    """Join the verified Arcamax SEX source using a discovered email key.
-
-    The Arcamax birthday/state/ZIP source is not the table in the supplied SEX
-    screenshot. Discover the key in Snowflake metadata so an unexpected schema
-    fails clearly instead of silently matching on a guessed column.
-    """
-    table = "APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE_DND_SF"
-    metadata_sql = (
-        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-        "WHERE TABLE_CATALOG=CURRENT_DATABASE() "
-        "AND TABLE_SCHEMA=CURRENT_SCHEMA() "
-        "AND TABLE_NAME='{0}' "
-        "AND COLUMN_NAME IN ('EMAIL', 'EMAILID', 'EMAIL_ADDRESS') "
-        "ORDER BY CASE COLUMN_NAME WHEN 'EMAIL' THEN 1 "
-        "WHEN 'EMAILID' THEN 2 ELSE 3 END"
-    ).format(table)
-    output = run_command([
-        "snowsql", "-c", "datateam1", "-q", metadata_sql,
-        "-o", "output_format=csv", "-o", "header=false",
-        "-o", "timing=false", "-o", "friendly=false", "-o", "exit_on_error=true",
-    ])
-    candidates = [line.strip().strip('"').upper() for line in output.splitlines()]
-    email_key = next((name for name in candidates
-                      if name in ("EMAIL", "EMAILID", "EMAIL_ADDRESS")), None)
-    if not email_key:
-        raise RuntimeError(
-            "Arcamax Gender source {0} has no verified EMAIL, EMAILID or "
-            "EMAIL_ADDRESS column in the current Snowflake schema."
-            .format(table)
-        )
-    _trace(log, "Arcamax Gender join key verified", table=table, email_key=email_key,
-           conflict_rule="different SEX values for the same email become NULL")
-    return (
-        "LEFT JOIN (SELECT email_key, "
-        "IFF(MIN(gender_value)=MAX(gender_value), MIN(gender_value), NULL) AS gender "
-        "FROM (SELECT LOWER(TRIM(TO_VARCHAR({key}))) AS email_key, "
-        "CASE UPPER(TRIM(TO_VARCHAR(SEX))) "
-        "WHEN 'M' THEN 'MALE' WHEN 'MALE' THEN 'MALE' "
-        "WHEN 'F' THEN 'FEMALE' WHEN 'FEMALE' THEN 'FEMALE' "
-        "ELSE NULL END AS gender_value "
-        "FROM {table} WHERE UPPER(TRIM(TO_VARCHAR(SEX))) "
-        "IN ('M','MALE','F','FEMALE')) gender_records "
-        "WHERE email_key <> '' GROUP BY email_key) g "
-        "ON LOWER(TRIM(TO_VARCHAR(a.email)))=g.email_key "
-    ).format(key=email_key, table=table)
-
-
-def _age_expression(channel):
+def _age_expression(channel, arcamax_columns=None):
     """Use the same integer age in filtering and COMPLETE output."""
-    source = _column_map(channel)["age"]
-    if channel in ("GREEN", "BLUE"):
+    source = _column_map(channel, arcamax_columns)["age"]
+    if channel in ("GREEN", "BLUE") or (channel == "ARCAMAX" and
+                                       source.upper().endswith(".AGE")):
         return "TRY_TO_NUMBER(TO_VARCHAR({0}))".format(source)
     birthday = "TRY_TO_DATE(TO_VARCHAR({0}))".format(source)
     years = "DATEDIFF(year, {0}, CURRENT_DATE())".format(birthday)
@@ -1905,10 +1401,11 @@ def _age_expression(channel):
     )
 
 
-def _criteria_predicate(channel, criteria, zip_staging_table, log):
+def _criteria_predicate(channel, criteria, zip_staging_table, log,
+                        arcamax_columns=None):
     """Build the OR condition used for one channel's source query."""
     channel = str(channel).upper()
-    columns = _column_map(channel)
+    columns = _column_map(channel, arcamax_columns)
     conditions = []
     for item in criteria:
         item_type = item["type"]
@@ -1919,7 +1416,7 @@ def _criteria_predicate(channel, criteria, zip_staging_table, log):
                        "{0},{1}".format(item.get("from", ""), item.get("to", ""))),
                zip_staging_table=(zip_staging_table or "not used"))
         if item_type == "age":
-            column = _age_expression(channel)
+            column = _age_expression(channel, arcamax_columns)
             if comparison == "between":
                 low, high = sorted((int(item["from"]), int(item["to"])))
                 conditions.append("{0} BETWEEN {1} AND {2}".format(column, low, high))
@@ -1939,7 +1436,7 @@ def _criteria_predicate(channel, criteria, zip_staging_table, log):
         elif item_type == "gender":
             # Validation above restricts this SQL literal to MALE/FEMALE.
             conditions.append("{0} = '{1}'".format(
-                _gender_expression(channel), item["values"][0]
+                _gender_expression(channel, arcamax_columns), item["values"][0]
             ))
         elif item_type == "zips":
             if not zip_staging_table:
@@ -1964,18 +1461,23 @@ def _create_criteria_channel_table(perm_table, channel, criteria,
     """Create one channel's standardised table for any supported criteria set."""
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
     channel = str(channel).upper()
-    predicate = _criteria_predicate(channel, criteria, zip_staging_table, log)
-    responder_join = _responder_join(channel, responder_match, responder_days)
     selected = {item["type"] for item in criteria}
-    columns = _column_map(channel)
+    arcamax_columns = (_arcamax_profile_columns(log, selected)
+                       if channel == "ARCAMAX" else None)
+    predicate = _criteria_predicate(channel, criteria, zip_staging_table, log,
+                                    arcamax_columns)
+    responder_join = _responder_join(
+        channel, responder_match, responder_days,
+        "a.{0}".format(arcamax_columns["email"]) if arcamax_columns else None)
+    columns = _column_map(channel, arcamax_columns)
     output_columns = []
     for kind, alias in (("age", "AGE"), ("state", "STATE"),
                         ("zips", "ZIP"), ("gender", "GENDER")):
         if kind in selected:
             if kind == "age":
-                value = _age_expression(channel)
+                value = _age_expression(channel, arcamax_columns)
             elif kind == "gender":
-                value = _gender_expression(channel)
+                value = _gender_expression(channel, arcamax_columns)
             else:
                 value = columns[kind]
             output_columns.append("{0} AS {1}".format(value, alias))
@@ -1994,13 +1496,14 @@ def _create_criteria_channel_table(perm_table, channel, criteria,
                  responder_join=responder_join, predicate=predicate,
                  selected_columns=selected_columns)
     elif channel == "ARCAMAX":
-        gender_join = _arcamax_gender_join(log) if "gender" in selected else ""
         sql = (
             "CREATE OR REPLACE TABLE {perm} AS "
-            "SELECT a.email{selected_columns} FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE a "
-            "{gender_join}"
-            "WHERE {predicate};"
-        ).format(perm=perm_table, gender_join=gender_join, predicate=predicate,
+            "SELECT a.{email} AS email{selected_columns} "
+            "FROM {profile} a "
+            "{responder_join}WHERE {predicate};"
+        ).format(perm=perm_table, email=arcamax_columns["email"],
+                 profile=_ARCAMAX_PROFILE_TABLE,
+                 responder_join=responder_join, predicate=predicate,
                  selected_columns=selected_columns)
     else:
         sql = (
@@ -2021,6 +1524,7 @@ def _create_criteria_channel_table(perm_table, channel, criteria,
            responder_days=(responder_days if responder_match else
                            (90 if channel == "ORANGE" else "not enabled")),
            selected_columns=",".join(item["type"] for item in criteria),
+           source_profile=(_ARCAMAX_PROFILE_TABLE if channel == "ARCAMAX" else "channel default"),
            sql=_safe_sql_for_log(sql))
     run_command(["snowsql", "-c", "datateam1", "-q", sql])
     count = _query_snowflake("SELECT COUNT(*) FROM {0}".format(perm_table), log)

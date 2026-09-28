@@ -50,7 +50,7 @@ class WorkflowRegressions(unittest.TestCase):
             with self.assertRaises(ValueError):
                 processor._criteria_from_request(request)
 
-    def test_gender_complete_only_and_arcamax_join_key(self):
+    def test_gender_complete_only_and_arcamax_profile_fields(self):
         captured = []
         with patch.object(processor, "_query_copy_unload_rows",
                           side_effect=lambda sql, log: captured.append(sql) or 1):
@@ -64,10 +64,78 @@ class WorkflowRegressions(unittest.TestCase):
             )
         self.assertIn('GENDER AS "gender"', captured[0])
         self.assertNotIn('GENDER AS "gender"', captured[1])
-        with patch.object(processor, "run_command", return_value="EMAIL_ADDRESS\n"):
-            join = processor._arcamax_gender_join(LOG)
-        self.assertIn("TO_VARCHAR(EMAIL_ADDRESS)", join)
-        self.assertIn("GROUP BY email_key", join)
+        with patch.object(processor, "run_command",
+                          return_value="EMAIL_ADDRESS\nAGE\nSTATE\nZIP\nSEX\n"):
+            fields = processor._arcamax_profile_columns(LOG, {"gender", "age"})
+        self.assertEqual(fields["email"], "EMAIL_ADDRESS")
+        self.assertEqual(fields["gender"], "SEX")
+        self.assertEqual(fields["age"], "AGE")
+        self.assertIn("a.SEX", processor._gender_expression("ARCAMAX", fields))
+        self.assertIn("TRY_TO_NUMBER", processor._age_expression("ARCAMAX", fields))
+
+    def test_arcamax_criteria_uses_new_profile_and_optional_open_date(self):
+        captured = []
+        def fake_run(command):
+            sql = command[command.index("-q") + 1]
+            if "INFORMATION_SCHEMA.COLUMNS" in sql:
+                return "EMAIL\nAGE\nSTATE\nZIP\nSEX\n"
+            captured.append(sql)
+            return ""
+        criteria = [{"type": "age", "comparison": "greater", "value": "40"},
+                    {"type": "state", "comparison": "include", "values": ["CA"]},
+                    {"type": "zips", "comparison": "include"},
+                    {"type": "gender", "comparison": "include", "values": ["FEMALE"]}]
+        with patch.object(processor, "run_command", side_effect=fake_run):
+            with patch.object(processor, "_query_snowflake", return_value=23):
+                count = processor._create_criteria_channel_table(
+                    "TEST_ARCAMAX", "ARCAMAX", criteria, "TEST_ZIPS", True, 30, LOG)
+        self.assertEqual(count, 23)
+        sql = captured[0]
+        self.assertIn("FROM GREEN.DT_DATA.APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE_DND_SF a", sql)
+        self.assertNotIn("FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE a", sql)
+        self.assertIn("a.SEX", sql)
+        self.assertIn("a.AGE", sql)
+        self.assertIn("a.STATE IN ('CA')", sql)
+        self.assertIn("a.ZIP IN (SELECT zip_code FROM TEST_ZIPS)", sql)
+        self.assertIn("GREEN.DT_DATA.ARCAMAX_DELIVERY_LOGS", sql)
+        self.assertIn("DATEADD(day, -30", sql)
+        self.assertIn("OPEN_DATE", sql)
+        self.assertEqual(processor._responder_join("ARCAMAX", False, None), "")
+
+    def test_arcamax_profile_accepts_date_age_and_validates_required_columns(self):
+        with patch.object(processor, "run_command",
+                          return_value="EMAIL_ADDRESS\nBIRTHDAY\nZIP_CODE\nGENDER\n"):
+            fields = processor._arcamax_profile_columns(LOG, {"age", "zips", "gender"})
+        self.assertIn("DATEDIFF(year", processor._age_expression("ARCAMAX", fields))
+        self.assertIn("a.GENDER", processor._gender_expression("ARCAMAX", fields))
+        with patch.object(processor, "run_command", return_value="EMAIL\nZIP\n"):
+            with self.assertRaisesRegex(RuntimeError, "missing required column.*gender"):
+                processor._arcamax_profile_columns(LOG, {"gender"})
+
+    def test_doordash_arcamax_zip_source_uses_new_profile(self):
+        captured = []
+        def fake_run(command):
+            sql = command[command.index("-q") + 1]
+            if "INFORMATION_SCHEMA.COLUMNS" in sql:
+                return "EMAIL\nZIP\n"
+            captured.append(sql)
+            return ""
+        with patch.object(processor, "run_command", side_effect=fake_run):
+            with patch.object(processor, "_query_snowflake", return_value=7):
+                count = processor._insert_into_perm_table(
+                    "TEST_ARCAMAX", "ARCAMAX", "TEST_ZIPS", "include", True, 21, LOG)
+        self.assertEqual(count, 7)
+        self.assertIn("FROM GREEN.DT_DATA.APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE_DND_SF a", captured[0])
+        self.assertIn("a.ZIP IN (SELECT zip_code FROM TEST_ZIPS)", captured[0])
+        self.assertIn("DATEADD(day, -21", captured[0])
+
+    def test_legacy_zip_entry_points_are_archived(self):
+        from old_module import zip_processor as legacy
+        for name in ("process_zip_request", "process_green_blue_zip",
+                     "process_arcamax_zip"):
+            self.assertFalse(hasattr(processor, name))
+            self.assertTrue(callable(getattr(legacy, name)))
+        self.assertTrue(callable(processor.process_orange_zip))
 
     def test_zip_radius_does_not_reuse_other_connection_passphrase(self):
         environments = []
