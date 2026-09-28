@@ -589,7 +589,7 @@ def _responder_join(channel_name, responder_match, responder_days, email_column=
         return (
             "JOIN (SELECT DISTINCT LOWER(TRIM(emailid)) AS email "
             "FROM GREEN.GREEN_LPT.RAW_OPENS_FOLLOWUP "
-            "WHERE CHANNELNAME='{0}' "
+            "WHERE UPPER(CHANNELNAME)='{0}' "
             "AND opendate >= DATEADD(day, -{1}, CURRENT_DATE())) responders "
             "ON LOWER(TRIM(a.email)) = responders.email ".format(
                 responder_channel, days
