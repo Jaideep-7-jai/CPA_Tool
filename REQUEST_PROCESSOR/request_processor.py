@@ -454,27 +454,23 @@ def _build_common_context(request_id, channel_name, run_dir: Path):
 # ---------------------------------------------------------------------------
 
 def _query_snowflake(query_sql, log):
-    """Run a snowsql query and return the first integer found in output, else -1."""
-    try:
-        _trace(log, "Snowflake validation query starting",
-               query=_safe_sql_for_log(query_sql))
-        os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
-        output = subprocess.check_output(
-            ["snowsql", "-c", "datateam1", "-q", query_sql,
-             "-o", "output_format=csv",
-             "-o", "header=false",
-             "-o", "timing=false",
-             "-o", "friendly=false"],
-            universal_newlines=True,
-            stderr=subprocess.STDOUT,
-        )
-        match = re.search(r"(\d+)", output)
-        count = int(match.group(1)) if match else -1
-        _trace(log, "Snowflake validation query finished", count=count)
-        return count
-    except Exception as exc:
-        log.warning(f"_query_snowflake failed (non-fatal): {exc}")
-        return -1
+    """Return one integer result; fail on SQL errors or malformed output."""
+    _trace(log, "Snowflake validation query starting",
+           query=_safe_sql_for_log(query_sql))
+    os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
+    output = run_command([
+        "snowsql", "-c", "datateam1", "-q", query_sql,
+        "-o", "output_format=csv", "-o", "header=false",
+        "-o", "timing=false", "-o", "friendly=false",
+        "-o", "exit_on_error=true",
+    ])
+    rows = list(csv.reader(io.StringIO(output)))
+    if len(rows) != 1 or len(rows[0]) != 1 or not re.fullmatch(r"[0-9]+", rows[0][0].strip()):
+        raise RuntimeError("Snowflake validation query did not return one integer: {0}".format(
+            output[:500]))
+    count = int(rows[0][0].strip())
+    _trace(log, "Snowflake validation query finished", count=count)
+    return count
 
 
 def _query_copy_unload_rows(copy_sql, log):
@@ -527,7 +523,8 @@ def _create_zip_staging_table(zip_staging_table: str, log) -> None:
         f"(zip_code VARCHAR(10));"
     )
     log.info(f"  Creating ZIP staging table: {zip_staging_table}")
-    run_command(["snowsql", "-c", "datateam1", "-q", sql])
+    run_command(["snowsql", "-c", "datateam1", "-q", sql,
+                 "-o", "exit_on_error=true"])
     log.info(f"  ZIP staging table created: {zip_staging_table}")
 
 
@@ -550,7 +547,8 @@ def _load_zips_from_s3(zip_staging_table: str, s3_zip_path: str, log) -> int:
     log.info(f"  COPY SQL: {_safe_sql_for_log(copy_sql)}")
     _trace(log, "ZIP staging load parameters", staging_table=zip_staging_table,
            s3_file=s3_zip_path, file_format="CSV comma-delimited, skip header=1")
-    run_command(["snowsql", "-c", "datateam1", "-q", copy_sql])
+    run_command(["snowsql", "-c", "datateam1", "-q", copy_sql,
+                 "-o", "exit_on_error=true"])
 
     count_sql    = f"SELECT COUNT(*) FROM {zip_staging_table};"
     loaded_count = _query_snowflake(count_sql, log)
@@ -569,7 +567,8 @@ def _drop_zip_staging_table(zip_staging_table: str, log) -> None:
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
     sql = f"DROP TABLE IF EXISTS {zip_staging_table};"
     log.info(f"  Dropping shared ZIP staging table: {zip_staging_table}")
-    run_command(["snowsql", "-c", "datateam1", "-q", sql])
+    run_command(["snowsql", "-c", "datateam1", "-q", sql,
+                 "-o", "exit_on_error=true"])
     log.info(f"  Shared ZIP staging table {zip_staging_table} dropped successfully")
 
 
@@ -710,7 +709,8 @@ def _insert_into_perm_table(
     log.info(f"  INSERT SQL       : {insert_sql}")
     log.info("  Executing CREATE + INSERT via snowsql ...")
 
-    run_command(["snowsql", "-c", "datateam1", "-q", insert_sql])
+    run_command(["snowsql", "-c", "datateam1", "-q", insert_sql,
+                 "-o", "exit_on_error=true"])
     log.info("  CREATE + INSERT executed successfully")
 
     count_sql     = f"SELECT COUNT(*) FROM {perm_table};"
@@ -800,7 +800,8 @@ def _drop_perm_table(perm_table, log):
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
     sql = f"DROP TABLE IF EXISTS {perm_table};"
     log.info(f"  Dropping permanent table: {perm_table}")
-    run_command(["snowsql", "-c", "datateam1", "-q", sql])
+    run_command(["snowsql", "-c", "datateam1", "-q", sql,
+                 "-o", "exit_on_error=true"])
     log.info(f"  Table {perm_table} dropped successfully")
 
 
@@ -1510,7 +1511,7 @@ def _create_criteria_channel_table(perm_table, channel, criteria,
             "CREATE OR REPLACE TABLE {perm} AS "
             "SELECT a.email_address, esp.ACCOUNT_NAME AS account_name{selected_columns} "
             "FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a "
-            "JOIN (select distinct a.ACCOUNT_NAME,b.FEEDID from APT_ADHOC_ESP_ACCOUNTS_DND a , APT_ADHOC_ESP_DATA_EXPORTS_DND b where a.ESP_ACCOUNT_ID=b.ESP_ACCOUNT_ID) esp"
+            "JOIN (select distinct a.ACCOUNT_NAME,b.FEEDID from APT_ADHOC_ESP_ACCOUNTS_DND a , APT_ADHOC_ESP_DATA_EXPORTS_DND b where a.ESP_ACCOUNT_ID=b.ESP_ACCOUNT_ID) esp "
             "ON a.FEED_ID=esp.FEEDID "
             "JOIN APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND p "
             "ON a.email_address=p.email_address "
@@ -1526,7 +1527,8 @@ def _create_criteria_channel_table(perm_table, channel, criteria,
            selected_columns=",".join(item["type"] for item in criteria),
            source_profile=(_ARCAMAX_PROFILE_TABLE if channel == "ARCAMAX" else "channel default"),
            sql=_safe_sql_for_log(sql))
-    run_command(["snowsql", "-c", "datateam1", "-q", sql])
+    run_command(["snowsql", "-c", "datateam1", "-q", sql,
+                 "-o", "exit_on_error=true"])
     count = _query_snowflake("SELECT COUNT(*) FROM {0}".format(perm_table), log)
     if count < 0:
         raise RuntimeError("Could not verify Snowflake row count for {0}".format(perm_table))

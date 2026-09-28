@@ -90,7 +90,8 @@ def _insert_apptness_into_perm_table(perm_table, zip_staging_table, comp_type, l
     _trace(log, "APPTNESS ZIP condition resolved",
            condition=("PROFILEDATAJSON:zipcode " + kw + " staging ZIP values"))
     log.info(f"  INSERT SQL       : {insert_sql}")
-    run_command(["snowsql", "-c", "datateam1", "-q", insert_sql])
+    run_command(["snowsql", "-c", "datateam1", "-q", insert_sql,
+                 "-o", "exit_on_error=true"])
     inserted_rows = _query_snowflake(f"SELECT COUNT(*) FROM {perm_table};", log)
     if inserted_rows >= 0:
         log.info(f"  Rows inserted into {perm_table}: {inserted_rows:,}")
@@ -252,7 +253,8 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
                selected_channels=",".join(completed), destination=email_s3)
         log.info("DoorDash combined email Snowflake SQL (AWS credentials redacted):\n%s",
                  _safe_sql_for_log(copy_email))
-        run_command(["snowsql", "-c", "datateam1", "-q", copy_email])
+        run_command(["snowsql", "-c", "datateam1", "-q", copy_email,
+                     "-o", "exit_on_error=true"])
         _trace(log, "combined email export completed", destination=email_s3)
         email_line_count = _download_and_combine(
             email_s3, run_dir / "EMAIL_FINAL_DL", run_dir / "EMAIL_FINAL_TMP",
@@ -277,7 +279,8 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
                    destination=md5_s3)
             log.info("DoorDash MD5 Snowflake SQL (AWS credentials redacted):\n%s",
                      _safe_sql_for_log(copy_md5))
-            run_command(["snowsql", "-c", "datateam1", "-q", copy_md5])
+            run_command(["snowsql", "-c", "datateam1", "-q", copy_md5,
+                         "-o", "exit_on_error=true"])
             _trace(log, "combined MD5 export completed", destination=md5_s3)
             md5_line_count = _download_and_combine(
                 md5_s3, run_dir / "MD5_FINAL_DL", run_dir / "MD5_FINAL_TMP",

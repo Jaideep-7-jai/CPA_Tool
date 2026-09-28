@@ -137,6 +137,42 @@ class WorkflowRegressions(unittest.TestCase):
             self.assertTrue(callable(getattr(legacy, name)))
         self.assertTrue(callable(processor.process_orange_zip))
 
+    def test_orange_esp_join_has_space_before_on(self):
+        statements = []
+        with patch.object(processor, "run_command",
+                          side_effect=lambda command: statements.append(command[command.index("-q") + 1])):
+            with patch.object(processor, "_query_snowflake", return_value=5):
+                processor._create_criteria_channel_table(
+                    "TEST_ORANGE", "ORANGE",
+                    [{"type": "gender", "comparison": "include", "values": ["MALE"]}],
+                    None, False, None, LOG,
+                )
+        self.assertIn(") esp ON a.FEED_ID=esp.FEEDID ", statements[0])
+        self.assertNotIn("espON", statements[0])
+
+    def test_count_validation_rejects_snowflake_error_code(self):
+        with patch.object(processor, "run_command", return_value=(
+                "002003 (42S02): SQL compilation error:\n"
+                "Object 'TEST_ORANGE' does not exist or not authorized.")) as command:
+            with self.assertRaisesRegex(RuntimeError, "did not return one integer"):
+                processor._query_snowflake("SELECT COUNT(*) FROM TEST_ORANGE", LOG)
+        self.assertIn("exit_on_error=true", command.call_args[0][0])
+        with patch.object(processor, "run_command", return_value="2003"):
+            self.assertEqual(processor._query_snowflake("SELECT COUNT(*) FROM TEST_ORANGE", LOG), 2003)
+
+    def test_orange_create_failure_stops_before_count(self):
+        with patch.object(processor, "run_command",
+                          side_effect=RuntimeError("SQL compilation error")) as command:
+            with patch.object(processor, "_query_snowflake") as count:
+                with self.assertRaisesRegex(RuntimeError, "SQL compilation error"):
+                    processor._create_criteria_channel_table(
+                        "TEST_ORANGE", "ORANGE",
+                        [{"type": "gender", "comparison": "include", "values": ["MALE"]}],
+                        None, True, 90, LOG,
+                    )
+        self.assertIn("exit_on_error=true", command.call_args[0][0])
+        count.assert_not_called()
+
     def test_zip_radius_does_not_reuse_other_connection_passphrase(self):
         environments = []
 
