@@ -23,7 +23,7 @@
       <div class="form-group">
         <label for="request_name"><i class="bi bi-tag-fill" style="color:var(--primary);margin-right:5px;"></i>Request Name</label>
         <div class="input-with-status">
-          <input type="text" name="request_name" id="request_name" required
+          <input type="text" name="request_name" id="request_name" required pattern="[A-Za-z0-9_]+" title="Use letters, numbers and underscores only"
                  placeholder="e.g. CPA_AGE_55_JUN2026" autocomplete="off">
           <span id="nameStatus" class="name-status"></span>
         </div>
@@ -45,7 +45,7 @@
       <div class="form-group">
         <label for="client_name"><i class="bi bi-building" style="color:var(--primary);margin-right:5px;"></i>Client Name</label>
         <div class="input-with-status">
-          <input type="text" name="client_name" id="client_name" required placeholder="Enter client name" autocomplete="off">
+          <input type="text" name="client_name" id="client_name" required pattern="[A-Za-z0-9_]+" title="Use letters, numbers and underscores only" placeholder="Enter client name" autocomplete="off">
           <span id="clientNameStatus" class="name-status"></span>
         </div>
         <small id="clientNameHint">Must be unique for the current day.</small>

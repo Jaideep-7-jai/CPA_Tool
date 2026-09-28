@@ -107,8 +107,8 @@ def _run_snow_sql(connection, query, log, key, secret, *, passphrase=None):
             environment["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = passphrase
         else:
             environment.pop("SNOWSQL_PRIVATE_KEY_PASSPHRASE", None)
-        log.debug("ZIP radius SnowSQL query on %s: %s", connection,
-                  _redact(query, key, secret))
+        log.info("ZIP radius SnowSQL query on %s (AWS credentials redacted):\n%s",
+                 connection, _redact(query, key, secret))
         timeout_seconds = _sql_timeout_seconds()
         log.info("ZIP radius SnowSQL started: connection=%s timeout=%ss",
                  connection, timeout_seconds)
@@ -215,6 +215,8 @@ def expand_zip_radius(source_s3_path, destination_table, radius_miles,
              request_id, radius_miles, _MILES_TO_KM)
     log.info("ZIP radius: source=%s table=%s; destination=%s table=%s",
              source_connection, source_table, destination_connection, destination_table)
+    log.info("ZIP radius: original S3=%s; expanded S3=%s; destination table=%s",
+             source_s3_path, output_s3_path, destination_table)
     log.info("ZIP radius: source passphrase available=%s; destination passphrase available=%s",
              bool(source_passphrase), bool(target_passphrase))
     existing_count = _count_rows(destination_connection, destination_table, log,

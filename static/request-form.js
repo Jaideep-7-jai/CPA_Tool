@@ -480,6 +480,12 @@ document.addEventListener('DOMContentLoaded', () => {
       nameIsValid = false;
       return;
     }
+    if (!/^[A-Za-z0-9_]+$/.test(name)) {
+      nameStatusEl.textContent = 'Enter a valid request name: letters, numbers and underscores only.';
+      nameStatusEl.className = 'name-status taken';
+      nameIsValid = false;
+      return;
+    }
     nameStatusEl.textContent = 'Checking…';
     nameStatusEl.className   = 'name-status checking';
 
@@ -491,7 +497,7 @@ document.addEventListener('DOMContentLoaded', () => {
           nameStatusEl.className   = 'name-status available';
           nameIsValid = true;
         } else {
-          nameStatusEl.textContent = '❌ Already taken';
+          nameStatusEl.textContent = data.error || '❌ Already taken';
           nameStatusEl.className   = 'name-status taken';
           nameIsValid = false;
         }
@@ -521,6 +527,12 @@ document.addEventListener('DOMContentLoaded', () => {
       clientNameIsValid = false;
       return;
     }
+    if (!/^[A-Za-z0-9_]+$/.test(clientName)) {
+      clientNameStatusEl.textContent = 'Enter a valid client name: letters, numbers and underscores only.';
+      clientNameStatusEl.className = 'name-status taken';
+      clientNameIsValid = false;
+      return;
+    }
 
     clientNameStatusEl.textContent = 'Checking…';
     clientNameStatusEl.className = 'name-status checking';
@@ -535,7 +547,7 @@ document.addEventListener('DOMContentLoaded', () => {
           clientNameEl.classList.remove('error-input');
           clientNameIsValid = true;
         } else {
-          clientNameStatusEl.textContent = '✖ Already used today';
+          clientNameStatusEl.textContent = data.error || '✖ Already used today';
           clientNameStatusEl.className = 'name-status taken';
           clientNameEl.classList.add('error-input');
           clientNameIsValid = false;

@@ -206,11 +206,93 @@ class WorkflowRegressions(unittest.TestCase):
             self.assertEqual(current.read_text(), "md5hash\nnewhash\n")
 
             with patch.object(merge, "run_command", side_effect=part_with_header("email")):
-                with self.assertRaisesRegex(RuntimeError, "md5hash column"):
+                with self.assertRaisesRegex(RuntimeError, "expected \\['md5hash'\\]"):
                     merge._download_merged_export(
                         "s3://bucket/merged", current, "DOORDASH_MD5HASH", tmp, LOG,
                     )
             self.assertEqual(current.read_text(), "md5hash\nnewhash\n")
+
+    def test_merge_sql_contains_only_final_columns_and_pair_dedupe(self):
+        scripts = {}
+        def capture(command):
+            scripts[next_channel[0]] = Path(command[command.index("-f") + 1]).read_text()
+        next_channel = [None]
+        with patch.object(merge, "run_command", side_effect=capture):
+            for channel in ("GREEN", "ORANGE", "DOORDASH_EMAIL", "DOORDASH_MD5HASH"):
+                next_channel[0] = channel
+                merge._snowflake_merge("s3://test/previous", "s3://test/current",
+                                        "s3://test/output", channel, 181, LOG)
+        for channel, sql in scripts.items():
+            self.assertNotIn("gender", sql.lower())
+            self.assertNotIn("MERGED_PRIVATE", sql)
+            self.assertIn("SKIP_HEADER=1", sql)
+            if channel == "ORANGE":
+                self.assertIn("PARTITION BY LOWER(TRIM(email)), LOWER(TRIM(account_name))", sql)
+                self.assertIn('account_name AS "accountname"', sql)
+                self.assertIn("email VARCHAR, account_name VARCHAR, source_order NUMBER", sql)
+            else:
+                self.assertIn("email VARCHAR, source_order NUMBER", sql)
+                self.assertNotIn("account_name VARCHAR", sql)
+
+    def test_orange_final_is_pair_for_suppression_and_default_responder_l90(self):
+        for request_type in ("Suppression", "Mailing"):
+            captured = []
+            with patch.object(processor, "_query_copy_unload_rows",
+                              side_effect=lambda sql, log: captured.append(sql) or 1):
+                processor._export_complete_final_file(
+                    "FINAL", "TEST_TABLE", "s3://test/orange", "ORANGE", LOG,
+                    criteria_columns=["age"], request_type=request_type)
+            self.assertIn('email_address AS "email", account_name AS "accountname"', captured[0])
+            self.assertNotIn("GENDER", captured[0])
+        join = processor._responder_join("ORANGE", False, None)
+        self.assertIn("APT_CUSTOM_L120_ORANGE_UNIQ_RESPONDERS_UNIQ_DND", join)
+        self.assertIn("DATEADD(day, -90", join)
+        self.assertIn("DATEADD(day, -30", processor._responder_join("ORANGE", True, 30))
+        self.assertEqual(processor._responder_join("GREEN", False, None), "")
+
+    def test_previous_merge_source_rejects_other_request_type(self):
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def execute(self, sql, params): self.sql, self.params = sql, params
+            def fetchone(self): return ("completed", "s3://test/source", "Mailing")
+        class Connection:
+            def cursor(self): return Cursor()
+            def close(self): pass
+        with patch.object(merge, "_db_connection", return_value=Connection()):
+            with self.assertRaisesRegex(ValueError, "should be Suppression"):
+                merge._previous_path(180, "ORANGE", LOG, "Suppression")
+
+    def test_doordash_orange_uses_its_final_pair_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            current = Path(tmp) / "orange.csv"
+            current.write_text("email_address|account_name\na@example.com|ESP1\n")
+            with patch.object(merge, "_previous_path", return_value="s3://test/previous") as previous:
+                with patch.object(merge, "_merge_to_current_file", return_value=(1, "s3://test/merged")) as execute:
+                    with patch.object(processor, "update_channel_storage"):
+                        with patch.object(merge, "_set_merge_status"):
+                            with patch.object(merge, "update_orange_merge_source_storage"):
+                                result = merge.merge_current_file(
+                                    181, 180, "ORANGE", current,
+                                    "s3://test/current", tmp, LOG,
+                                    request_type="Doordash")
+            previous.assert_called_once_with(180, "ORANGE", LOG, "Doordash")
+            self.assertEqual(execute.call_args.args[3], "ORANGE")
+            self.assertEqual(result["s3_path"], "s3://test/merged")
+
+    def test_orange_suppression_delivers_unique_email_from_pair_final(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / "orange.csv"
+            raw.write_text("email|accountname\na@example.com|ESP1\n"
+                           "a@example.com|ESP2\nb@example.com|ESP1\n")
+            context = {"final_files_dir": root / "final", "channel_tmp": root,
+                       "output_file": "out.csv"}
+            context["final_files_dir"].mkdir()
+            _, delivery, count = processor._write_orange_delivery(
+                raw, context, "Suppression", LOG)
+            self.assertEqual(count, 2)
+            self.assertEqual(delivery.read_text(), "email\na@example.com\nb@example.com\n")
 
     def test_notification_has_requested_radius_and_short_error(self):
         rows = dict(utils._request_detail_rows({"zip_radius": 25}))

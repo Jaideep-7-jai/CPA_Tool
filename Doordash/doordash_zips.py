@@ -26,6 +26,7 @@ from REQUEST_PROCESSOR.request_processor import (
     _query_snowflake,
     _step,
     _trace,
+    _safe_sql_for_log,
     _verify_local_file,
     fetch_request_details,
     process_orange_zip,
@@ -117,7 +118,8 @@ def insert_complete_extract(request_id, channel_name, zip_staging_table, run_dir
         target_table=perm_table, complete_s3_path=ctx["path_COMPLETE"],
         responder_match=bool(ctx["request_data"].get("responder_match")),
         responder_days=(ctx["request_data"].get("responder_days")
-                        if ctx["request_data"].get("responder_match") else "not enabled"),
+                        if ctx["request_data"].get("responder_match")
+                        else (90 if channel_name == "ORANGE" else "not enabled")),
     )
 
     try:
@@ -248,6 +250,8 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
         _step(log, 3, 7, "Exporting combined DoorDash email file to S3", "DOORDASH")
         _trace(log, "combined email export starting", source_channel_count=len(completed),
                selected_channels=",".join(completed), destination=email_s3)
+        log.info("DoorDash combined email Snowflake SQL (AWS credentials redacted):\n%s",
+                 _safe_sql_for_log(copy_email))
         run_command(["snowsql", "-c", "datateam1", "-q", copy_email])
         _trace(log, "combined email export completed", destination=email_s3)
         email_line_count = _download_and_combine(
@@ -271,6 +275,8 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
             )
             _trace(log, "combined MD5 export starting", source_table=arcamax_table,
                    destination=md5_s3)
+            log.info("DoorDash MD5 Snowflake SQL (AWS credentials redacted):\n%s",
+                     _safe_sql_for_log(copy_md5))
             run_command(["snowsql", "-c", "datateam1", "-q", copy_md5])
             _trace(log, "combined MD5 export completed", destination=md5_s3)
             md5_line_count = _download_and_combine(

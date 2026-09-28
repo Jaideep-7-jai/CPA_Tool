@@ -9,6 +9,7 @@ import uuid
 import shlex
 import json
 import os
+import re
 from config import S3_BASE
 
 
@@ -1145,6 +1146,8 @@ def api_check_name():
     name = request.args.get('name', '').strip()
     if not name:
         return jsonify({'available': False, 'error': 'Name is empty'})
+    if not re.fullmatch(r'[A-Za-z0-9_]+', name):
+        return jsonify({'available': False, 'error': 'Enter a valid request name: letters, numbers and underscores only.'})
     taken = is_request_name_taken(name)
     return jsonify({'available': not taken})
 
@@ -1155,6 +1158,8 @@ def api_check_client_name():
     client_name = request.args.get('client_name', '').strip()
     if not client_name:
         return jsonify({'available': False, 'error': 'Client Name is empty'})
+    if not re.fullmatch(r'[A-Za-z0-9_]+', client_name):
+        return jsonify({'available': False, 'error': 'Enter a valid client name: letters, numbers and underscores only.'})
     taken = is_client_name_taken_today(client_name)
     return jsonify({'available': not taken})
 
@@ -1200,15 +1205,10 @@ def api_check_merge_source():
         })
 
     previous_type = previous[0]
-    if current_type == 'Doordash' and previous_type != 'Doordash':
+    if previous_type != current_type:
         return jsonify({
             'available': False,
-            'message': 'DoorDash output can be merged only with a completed DoorDash request.'
-        })
-    if current_type != 'Doordash' and previous_type == 'Doordash':
-        return jsonify({
-            'available': False,
-            'message': 'Suppression/Mailing output cannot be merged with a DoorDash request.'
+            'message': 'Previous merged request type should be {0}.'.format(current_type)
         })
 
     label = (
@@ -1308,6 +1308,8 @@ def submit_request():
 
     if not request_name:
         return jsonify({'ok': False, 'error': 'Request Name is required.'}), 400
+    if not re.fullmatch(r'[A-Za-z0-9_]+', request_name):
+        return jsonify({'ok': False, 'error': 'Enter a valid request name: letters, numbers and underscores only.'}), 400
     if is_request_name_taken(request_name):
         return jsonify({'ok': False, 'error': f'Request name "{request_name}" is already taken.'}), 400
     if request_type not in {'Suppression', 'Mailing', 'Doordash'}:
@@ -1354,6 +1356,8 @@ def submit_request():
 
     if not client_name:
         return jsonify({'ok': False, 'error': 'Client Name is required.'}), 400
+    if not re.fullmatch(r'[A-Za-z0-9_]+', client_name):
+        return jsonify({'ok': False, 'error': 'Enter a valid client name: letters, numbers and underscores only.'}), 400
     if is_client_name_taken_today(client_name):
         return jsonify({
             'ok': False,
@@ -1458,10 +1462,8 @@ def submit_request():
                 previous = cur.fetchone()
                 if not previous:
                     return jsonify({'ok': False, 'error': 'Previous Request Name must be a completed request.'}), 400
-                if request_type == 'Doordash' and previous[1] != 'Doordash':
-                    return jsonify({'ok': False, 'error': 'DoorDash output can be merged only with a completed DoorDash request.'}), 400
-                if request_type != 'Doordash' and previous[1] == 'Doordash':
-                    return jsonify({'ok': False, 'error': 'Suppression/Mailing output cannot be merged with a DoorDash request.'}), 400
+                if previous[1] != request_type:
+                    return jsonify({'ok': False, 'error': 'Previous merged request type should be {0}.'.format(request_type)}), 400
                 merge_source_request_id = previous[0]
         finally:
             conn.close()

@@ -67,7 +67,6 @@ import logging
 import pymysql
 import subprocess
 import shlex
-import pandas as pd
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -577,11 +576,13 @@ def _drop_zip_staging_table(zip_staging_table: str, log) -> None:
 # ── Per-channel perm table helpers ───────────────────────────────────────────
 
 def _responder_join(channel_name, responder_match, responder_days):
-    """Return the optional, deduplicated responder join for one channel."""
+    """Apply Orange's default L90 match, or the explicitly selected window."""
     channel_name = str(channel_name).upper()
-    if not responder_match or channel_name not in ("GREEN", "BLUE", "ORANGE"):
+    if channel_name not in ("GREEN", "BLUE", "ORANGE"):
         return ""
-    days = int(responder_days or 0)
+    if not responder_match and channel_name != "ORANGE":
+        return ""
+    days = int(responder_days or 0) if responder_match else 90
     if days < 1:
         raise ValueError("Responder Match requires responder_days to be at least 1.")
     if channel_name in ("GREEN", "BLUE"):
@@ -624,7 +625,8 @@ def _insert_into_perm_table(
         comparison=comp_type, sql_operator=kw,
         staging_table=zip_staging_table,
         responder_match=bool(responder_match),
-        responder_days=responder_days if responder_match else "not enabled",
+        responder_days=(responder_days if responder_match else
+                        (90 if channel_name == "ORANGE" else "not enabled")),
         responder_join_enabled=bool(responder_join),
         target_table=perm_table,
     )
@@ -727,10 +729,8 @@ def _export_complete_final_file(export_type, perm_table, export_path, channel_na
                     '{0} AS "{1}"'.format(col.upper(), col) for col in criteria_columns
                 ]
                 select_clause = ", ".join(selected)
-            elif orange_merge_source or str(request_type).lower() == "mailing":
-                select_clause = "DISTINCT " + email + ", " + account
             else:
-                select_clause = "DISTINCT " + email
+                select_clause = "DISTINCT " + email + ", " + account
         elif export_type == "COMPLETE":
             select_clause = ", ".join(['email AS "email"'] + [
                 '{0} AS "{1}"'.format(col.upper(), col) for col in criteria_columns
@@ -1293,7 +1293,7 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
         staging_table=zip_staging_table,
         responder_match=bool(ctx["request_data"].get("responder_match")),
         responder_days=(ctx["request_data"].get("responder_days")
-                        if ctx["request_data"].get("responder_match") else "not enabled"),
+                        if ctx["request_data"].get("responder_match") else 90),
         merge_source_request_id=(ctx["request_data"].get("merge_source_request_id") or "NULL"),
     )
     log.info(
@@ -1359,6 +1359,7 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
         )
         combined_path = channel_tmp / ctx["output_file"]
         _verify_local_file(log, "ORANGE combined raw file", combined_path)
+        combined_count = max(combined_count - 1, 0)  # combine count includes the header
         _trace(log, "channel storage update", channel=channel_name,
                s3_path=path_FINAL, row_count=combined_count)
         update_channel_storage(request_id, channel_name, path_FINAL, combined_count, log)
@@ -1382,67 +1383,16 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
         log.info(f"  STEP 5 DONE: Combined file rows: {combined_count:,}")
 
         # ── STEP 6/7 ── Build the format requested by the CURRENT request ─
-        request_type = str(ctx["request_type"]).lower()
-        df_final = pd.read_csv(
-            str(combined_path), sep="|", header=0,
-            names=["email", "account_name"], dtype=str,
-        ).fillna("")
-        _trace(log, "ORANGE data validation", raw_file=combined_path,
-               dataframe_rows=len(df_final),
-               expected_columns="email,account_name",
-               actual_columns="|".join(str(column) for column in df_final.columns),
-               empty_email_rows=int((df_final["email"].str.strip() == "").sum()))
-
-        legacy_doordash_output = request_type == "doordash"
-        if request_type == "suppression":
-            _step(log, 6, TOTAL_STEPS, "Creating ORANGE suppression email list", channel_name)
-            output_file = ctx["output_file"]
-            final_file_path = final_files_dir / output_file
-            email_rows = df_final[["email"]].drop_duplicates()
-            email_rows.to_csv(str(final_file_path), index=False, header=False)
-            _verify_local_file(log, "ORANGE suppression CSV", final_file_path)
-            record_count = len(email_rows)
-            log.info(
-                f"  STEP 6 DONE: Suppression CSV created -> {final_file_path} "
-                f"| unique emails: {record_count:,}"
-            )
-
-        else:
-            _step(log, 6, TOTAL_STEPS, "Splitting ORANGE file per-ESP + creating ZIP archive", channel_name)
-            output_path = channel_tmp / "ORANGE_OP_PATH"
-            output_path.mkdir(exist_ok=True)
-            esp_names = df_final["account_name"].drop_duplicates().sort_values().tolist()
-            record_count = 0
-            log.info(f"  Total ORANGE records: {len(df_final):,} across {len(esp_names)} ESPs")
-
-            for esp in esp_names:
-                df_esp = df_final[df_final["account_name"] == esp][["email"]].drop_duplicates()
-                esp_file = output_path / f"{esp}_ORANGE_DATA.csv"
-                df_esp.to_csv(esp_file, index=False, header=False)
-                _verify_local_file(log, f"ORANGE ESP file ({esp})", esp_file)
-                record_count += len(df_esp)
-                log.info(f"  ESP {esp}: {len(df_esp):,} records")
-
-            output_file = ctx["output_file"].replace(".csv", ".zip")
-            final_file_path = final_files_dir / output_file
-            if not esp_names:
-                raise RuntimeError(
-                    "ORANGE mailing output has no non-empty ESP groups; "
-                    "a ZIP archive cannot be created."
-                )
-            _trace(log, "ORANGE mailing archive validation",
-                   esp_file_count=len(esp_names), zip_path=final_file_path)
-            run_command(
-                ["zip", "-r", str(final_file_path), output_path.name],
-                cwd=str(channel_tmp)
-            )
-            _verify_local_file(log, "ORANGE mailing ZIP", final_file_path)
-            log.info(f"  STEP 6 DONE: Mailing ESP ZIP created -> {final_file_path}")
-            if legacy_doordash_output:
-                # The raw CSV is already retained in S3 for audit/merge.
-                # FINAL_FILES contains delivery artifacts only.
-                _trace(log, "DoorDash Orange raw data retained in S3",
-                       s3_prefix=path_FINAL, delivery_zip=output_file)
+        # The DoorDash Orange FINAL export keeps email_address/account_name;
+        # delivery is streamed so even a very large merged list stays bounded.
+        _step(log, 6, TOTAL_STEPS, "Streaming Orange ESP delivery and ZIP archive", channel_name)
+        output_file, final_file_path, record_count = _write_orange_delivery(
+            combined_path, ctx, ctx["request_type"], log
+        )
+        _trace(log, "DoorDash Orange FINAL to delivery validated",
+               source_s3=path_FINAL, output_file=output_file,
+               row_count=record_count, merge_mode=merge_mode)
+        legacy_doordash_output = str(ctx["request_type"]).lower() == "doordash"
 
         _cleanup_channel_tmp(channel_tmp, log)
 
@@ -2062,13 +2012,14 @@ def _create_criteria_channel_table(perm_table, channel, criteria,
             "JOIN APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND p "
             "ON a.email_address=p.email_address "
             "{responder_join}WHERE {predicate} "
-            "QUALIFY ROW_NUMBER() OVER (PARTITION BY a.email_address "
+            "QUALIFY ROW_NUMBER() OVER (PARTITION BY LOWER(TRIM(a.email_address)), esp.ACCOUNT_NAME "
             "ORDER BY a.created_at DESC)=1;"
         ).format(perm=perm_table, responder_join=responder_join,
                  predicate=predicate, selected_columns=selected_columns)
     _trace(log, "Snowflake criteria table creation", channel=channel,
            target_table=perm_table, responder_match=bool(responder_match),
-           responder_days=(responder_days if responder_match else "not enabled"),
+           responder_days=(responder_days if responder_match else
+                           (90 if channel == "ORANGE" else "not enabled")),
            selected_columns=",".join(item["type"] for item in criteria),
            sql=_safe_sql_for_log(sql))
     run_command(["snowsql", "-c", "datateam1", "-q", sql])
@@ -2139,21 +2090,27 @@ def _write_orange_delivery(raw_file, context, request_type, log):
 
         if str(request_type).lower() == "suppression":
             final_file = final_dir / context["output_file"]
-            record_count = 0
-            with open(str(final_file), "w", newline="") as destination:
-                writer = csv.writer(destination, lineterminator="\n")
-                # Account/ESP is routing metadata only.  The delivered
-                # suppression file always has the requested email header.
-                writer.writerow(["email"])
+            unsorted = context["channel_tmp"] / "orange_suppression_emails.tmp"
+            sorted_emails = context["channel_tmp"] / "orange_suppression_unique.tmp"
+            with open(str(unsorted), "w", newline="") as destination:
                 for row in reader:
                     email = str(row.get(email_column) or "").strip()
-                    if not email:
-                        continue
-                    writer.writerow([email])
-                    record_count += 1
+                    if email:
+                        destination.write(email + "\n")
+            with open(str(sorted_emails), "w", newline="") as destination:
+                subprocess.run(["sort", "-u", "-T", str(context["channel_tmp"]),
+                                str(unsorted)], stdout=destination, check=True)
+            record_count = 0
+            with open(str(final_file), "w", newline="") as destination:
+                destination.write("email\n")
+                with open(str(sorted_emails), "r") as unique_rows:
+                    for email in unique_rows:
+                        destination.write(email)
+                        record_count += 1
             _verify_local_file(log, "Orange suppression delivery", final_file)
             _trace(log, "Orange suppression delivery created",
-                   filename=final_file.name, row_count=record_count)
+                   filename=final_file.name, row_count=record_count,
+                   dedupe="external sort by email", source_header="email|accountname")
             return final_file.name, final_file, record_count
 
         esp_dir = context["channel_tmp"] / "ORANGE_ESP"
@@ -2220,19 +2177,12 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
     table_created = False
     selected_columns = ["zip" if item["type"] == "zips" else item["type"]
                         for item in criteria]
-    is_orange_mailing = (channel == "ORANGE" and
-                         str(request_data["request_type"]).lower() == "mailing")
-    final_data_header = "email|accountname" if is_orange_mailing else "email"
+    final_data_header = "email|accountname" if channel == "ORANGE" else "email"
     complete_data_header = "|".join(
         (["email", "accountname"] if channel == "ORANGE" else ["email"])
         + selected_columns
     )
-    orange_merge_source_s3 = (
-        "{0}/{1}/{2}/{3}/ORANGE_MERGE_SOURCE".format(
-            S3_BASE, request_data["request_type"], context["path_date"],
-            _safe_identifier(request_data["request_name"])
-        ) if channel == "ORANGE" and not is_orange_mailing else None
-    )
+    orange_merge_source_s3 = context["path_FINAL"] if channel == "ORANGE" else None
     _trace(log, "consolidated channel start", request_id=request_id, channel=channel,
            criteria_json=json.dumps(criteria, sort_keys=True),
            zip_staging_table=(zip_staging_table or "not used"),
@@ -2268,17 +2218,9 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
             "COMPLETE", context["perm_table"], context["path_COMPLETE"], channel, log,
             criteria_columns=selected_columns, request_type=request_data["request_type"],
         )
-        if orange_merge_source_s3:
-            _trace(log, "exporting private Orange merge source",
-                   s3_path=orange_merge_source_s3)
-            _export_complete_final_file(
-                "FINAL", context["perm_table"], orange_merge_source_s3,
-                channel, log, criteria_columns=selected_columns,
-                request_type=request_data["request_type"],
-                orange_merge_source=True,
-            )
-        elif channel == "ORANGE":
-            orange_merge_source_s3 = context["path_FINAL"]
+        if channel == "ORANGE":
+            _trace(log, "Orange merge source is FINAL export",
+                   s3_path=orange_merge_source_s3, header=final_data_header)
 
         _step(log, 4, 9, "Dropping validated Snowflake table", channel)
         _drop_perm_table(context["perm_table"], log)
@@ -2373,7 +2315,7 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
             "complete_s3_path": context["path_COMPLETE"],
             "final_data_header": final_data_header,
             "complete_data_header": complete_data_header,
-            "final_count": delivery_count,
+            "final_count": count,
             "complete_count": complete_export_count if complete_export_count >= 0 else "",
             "local_output_dir": str(context["final_files_dir"]),
         }
@@ -2394,7 +2336,7 @@ def _process_criteria_channel(request_data, criteria, zip_staging_table, run_dir
                 "complete_s3_path": context["path_COMPLETE"],
                 "final_data_header": final_data_header,
                 "complete_data_header": complete_data_header,
-                "final_count": delivery_count,
+                "final_count": count,
                 "complete_count": complete_export_count if complete_export_count >= 0 else "",
                 "merge_source_request_id": request_data.get("merge_source_request_id") or "",
                 "merge_source_request_name": request_data.get("merge_source_request_name") or "",
