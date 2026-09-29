@@ -1,5 +1,6 @@
 """Small, offline checks for the request paths that failed in production."""
 
+import ast
 import gzip
 import json
 import logging
@@ -30,6 +31,43 @@ LOG = logging.getLogger(__name__)
 
 
 class WorkflowRegressions(unittest.TestCase):
+    def test_notifications_use_only_configured_cpa_and_tech_lists(self):
+        with patch.object(utils, "CPAUSER_EMAIL", ["cpa@example.com"]):
+            with patch.object(utils, "TECH_NOTIFICATION_RECIPIENTS", ["tech@example.com"]):
+                with patch.dict(os.environ, {"CPA_EMAIL_TECH_RECIPIENTS": "unused@example.com",
+                                          "CPA_EMAIL_CPA_RECIPIENTS": "unused@example.com"}):
+                    self.assertEqual(utils._notification_recipients(
+                        {"username": "cpauser"}, is_error=True),
+                        ["cpa@example.com", "tech@example.com"])
+                    self.assertEqual(utils._notification_recipients(
+                        {"username": "techuser"}, is_error=True),
+                        ["tech@example.com"])
+
+    def test_request_job_timestamps_use_mysql_now(self):
+        source = ast.parse(Path("app.py").read_text())
+        update_node = next(node for node in source.body
+                           if isinstance(node, ast.FunctionDef) and node.name == "update_request_db")
+        commands = []
+        class Cursor:
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                return False
+            def execute(self, sql, values):
+                commands.append((sql, values))
+        connection = types.SimpleNamespace(cursor=lambda: Cursor(), close=lambda: None)
+        clock = object()
+        scope = {"get_db": lambda: connection, "_DB_NOW": clock, "_CHANNEL_COLUMNS": set()}
+        exec(compile(ast.Module(body=[update_node], type_ignores=[]), "app.py", "exec"), scope)
+        scope["update_request_db"]("request-1", overall_status="inprogress",
+                                   started_at=clock)
+        scope["update_request_db"]("request-1", overall_status="completed",
+                                   finished_at=clock)
+        for sql, values in commands:
+            self.assertIn("=NOW()", sql)
+            self.assertEqual(values[-1], "request-1")
+            self.assertEqual(len(values), 2)
+
     def test_gender_is_one_choice_and_works_with_other_criteria(self):
         request = {
             "criteria_json": '[{"type":"gender","comparison":"include",'

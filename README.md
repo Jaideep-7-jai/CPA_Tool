@@ -103,9 +103,6 @@ export CPA_FTP_PASSWORD='…'
 export CPA_FTP_HOST='…'
 # Private-key passphrase for the snowflake (zx_dataops_service) connection:
 export SNOWSQL_PRIVATE_KEY_PASSPHRASE='…'
-export CPA_EMAIL_TECH_RECIPIENTS='…'
-export CPA_EMAIL_DATATEAM_RECIPIENTS='…'
-export CPA_EMAIL_CPA_RECIPIENTS='…'
 export CPA_EMAIL_CPA_USERNAMES='cpauser'
 # Only if the snowflake connection requires its own private-key passphrase:
 # export CPA_ZIP_RADIUS_SNOWSQL_PASSPHRASE='…'
@@ -120,12 +117,17 @@ name, client name, request type, criteria/value/comparison, channels, responder
 match days, requested ZIP radius, and merge source. Error e-mails contain a short exit reason and a
 support-log location rather than embedding the full log.
 
-`CPA_EMAIL_CPA_USERNAMES` controls the FTP-only recipient view.  Those users
-receive file name, header, final count, FTP path, and merge status.  Technical
-and Data Team recipients additionally receive the local output location and
+`CPAUSER_EMAIL` and `TECH_NOTIFICATION_RECIPIENTS` in `config.py` supply the
+notification addresses. CPA requests go to both lists; other requests go to
+the technical list. `CPA_EMAIL_CPA_USERNAMES` controls the FTP-only content
+view for CPA requests. Those users receive file name, header, final count,
+FTP path, and merge status. Notifications for technical requests also include the local output location and
 the `FINAL`/`COMPLETE` S3 paths, headers, and counts.  `COMPLETE` is audit data
 and may include ZIP/account fields even when a delivery file contains only
 `email`.
+
+Request creation and completion times are written using MySQL's session
+clock. Existing rows with mixed-clock timestamps are not changed by this fix.
 
 ## Previous-output merge
 

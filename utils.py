@@ -23,14 +23,10 @@ from email.mime.multipart import MIMEMultipart
 import config as _app_config
 
 
-# Keep the notification implementation compatible with both the newer
-# RECIPIENT/CC_RECIPIENTS settings and the repository's original distribution
-# list settings.  The latter are used when a deployed config.py has not yet
-# been updated with the newer names.
 DB_CONFIG = _app_config.DB_CONFIG
 SENDER = _app_config.SENDER
-LEGACY_TECH_RECIPIENTS = getattr(_app_config, "TECH_NOTIFICATION_RECIPIENTS", ())
-LEGACY_CPA_RECIPIENTS = getattr(_app_config, "CPAUSER_EMAIL", ())
+TECH_NOTIFICATION_RECIPIENTS = _app_config.TECH_NOTIFICATION_RECIPIENTS
+CPAUSER_EMAIL = _app_config.CPAUSER_EMAIL
 
 def ensure_output_dir(output_dir, criteria_type):
     """
@@ -219,45 +215,15 @@ def _is_cpa_user(request_details):
 
 
 def _notification_recipients(request_details, is_error=False):
-    """Resolve notification recipients from service environment configuration.
-
-    The legacy RECIPIENT/CC_RECIPIENTS values remain safe fallbacks.  Configure
-    the environment variables below in production so recipient routing is not
-    embedded in Git:
-
-    * CPA_EMAIL_TECH_RECIPIENTS
-    * CPA_EMAIL_DATATEAM_RECIPIENTS
-    * CPA_EMAIL_CPA_RECIPIENTS
-    * CPA_EMAIL_CPA_USERNAMES
-    """
-    tech_recipients = _split_recipients(
-        os.getenv("CPA_EMAIL_TECH_RECIPIENTS", ""),
-        LEGACY_TECH_RECIPIENTS,
-        RECIPIENT,
-    )
-    datateam_recipients = _split_recipients(
-        os.getenv("CPA_EMAIL_DATATEAM_RECIPIENTS", ""),
-        CC_RECIPIENTS,
-    )
-    cpa_recipients = _split_recipients(
-        os.getenv("CPA_EMAIL_CPA_RECIPIENTS", ""),
-        LEGACY_CPA_RECIPIENTS,
-    )
-
-    if _is_cpa_user(request_details):
-        # CPA users receive the FTP-only view plus the Data Team.  If an
-        # operator has not configured a dedicated CPA distribution list, retain
-        # the old primary recipient rather than silently dropping a mail.
-        recipients = _split_recipients(
-            cpa_recipients or tech_recipients,
-            datateam_recipients,
-        )
-    else:
-        recipients = _split_recipients(tech_recipients, datateam_recipients)
+    """Route CPA requests to CPA and technical lists; other requests to tech."""
+    tech_recipients = _split_recipients(TECH_NOTIFICATION_RECIPIENTS)
+    recipients = (_split_recipients(CPAUSER_EMAIL, tech_recipients)
+                  if _is_cpa_user(request_details) else tech_recipients)
 
     if not recipients:
         raise RuntimeError(
-            "No notification recipients are configured. Set CPA_EMAIL_*_RECIPIENTS."
+            "No notification recipients are configured in "
+            "config.TECH_NOTIFICATION_RECIPIENTS or config.CPAUSER_EMAIL."
         )
     return recipients
 
@@ -265,9 +231,7 @@ def _notification_recipients(request_details, is_error=False):
 def send_email(subject, body_text, is_error=False, html_body=None, recipients=None):
     """Send a text and HTML notification and return whether SMTP accepted it."""
     try:
-        recipients = list(recipients or _split_recipients(
-            LEGACY_TECH_RECIPIENTS, RECIPIENT, CC_RECIPIENTS,
-        ))
+        recipients = list(recipients or _split_recipients(TECH_NOTIFICATION_RECIPIENTS))
         if not recipients:
             raise RuntimeError("No notification recipients are configured.")
 

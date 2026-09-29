@@ -64,6 +64,7 @@ _CHANNEL_COLUMNS = {
 # All recognised channel names (excluding ALL)
 _ALL_CHANNELS = ("GREEN", "BLUE", "ARCAMAX", "ORANGE", "APPTNESS")
 _PRIVILEGED_USERS = {"admin", "jaideep"}
+_DB_NOW = object()
 
 
 
@@ -480,8 +481,11 @@ def update_request_db(request_uuid, **kwargs):
     fields, values = [], []
     for key, value in kwargs.items():
         if key in allowed:
-            fields.append(f"`{key}`=%s")
-            values.append(value)
+            if key in ("started_at", "finished_at") and value is _DB_NOW:
+                fields.append(f"`{key}`=NOW()")
+            else:
+                fields.append(f"`{key}`=%s")
+                values.append(value)
     if not fields:
         return
     values.append(request_uuid)
@@ -870,7 +874,7 @@ def run_job(request_uuid, request_name, cmd, output_dir):
     update_request_db(
         request_uuid,
         overall_status="inprogress",
-        started_at=now_str(),
+        started_at=_DB_NOW,
         command_text=" ".join(shlex.quote(c) for c in cmd)
     )
     try:
@@ -894,7 +898,7 @@ def run_job(request_uuid, request_name, cmd, output_dir):
         update_request_db(
             request_uuid,
             overall_status=final_status,
-            finished_at=now_str(),
+            finished_at=_DB_NOW,
             return_code=proc.returncode,
             stdout_text=stdout_text[-20000:],
             stderr_text=stderr_text[-20000:],
@@ -917,7 +921,7 @@ def run_job(request_uuid, request_name, cmd, output_dir):
         update_request_db(
             request_uuid,
             overall_status="failed",
-            finished_at=now_str(),
+            finished_at=_DB_NOW,
             return_code=-2,
             stderr_text=f"Job timed out after {JOB_TIMEOUT} seconds.",
             log_file=find_latest_log(output_dir),
@@ -929,7 +933,7 @@ def run_job(request_uuid, request_name, cmd, output_dir):
         update_request_db(
             request_uuid,
             overall_status="failed",
-            finished_at=now_str(),
+            finished_at=_DB_NOW,
             return_code=-1,
             stderr_text=str(exc),
             log_file=find_latest_log(output_dir),
